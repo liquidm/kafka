@@ -77,9 +77,9 @@ object DumpLogSegments {
       }
     }
     nonConsecutivePairsForLogFilesMap.foreach {
-      case (fileName, listOfNonSecutivePairs) => {
+      case (fileName, listOfNonConsecutivePairs) => {
         System.err.println("Non-secutive offsets in :" + fileName)
-        listOfNonSecutivePairs.foreach(m => {
+        listOfNonConsecutivePairs.foreach(m => {
           System.err.println("  %d is followed by %d".format(m._1, m._2))
         })
       }
@@ -94,16 +94,16 @@ object DumpLogSegments {
     val startOffset = file.getName().split("\\.")(0).toLong
     val logFileName = file.getAbsolutePath.split("\\.")(0) + Log.LogFileSuffix
     val logFile = new File(logFileName)
-    val messageSet = new FileMessageSet(logFile)
+    val messageSet = new FileMessageSet(logFile, false)
     val index = new OffsetIndex(file = file, baseOffset = startOffset)
     for(i <- 0 until index.entries) {
       val entry = index.entry(i)
       val partialFileMessageSet: FileMessageSet = messageSet.read(entry.position, maxMessageSize)
       val messageAndOffset = getIterator(partialFileMessageSet.head, isDeepIteration = true).next()
       if(messageAndOffset.offset != entry.offset + index.baseOffset) {
-        var misMatchesSeq = misMatchesForIndexFilesMap.getOrElse(file.getName, List[(Long, Long)]())
+        var misMatchesSeq = misMatchesForIndexFilesMap.getOrElse(file.getAbsolutePath, List[(Long, Long)]())
         misMatchesSeq ::=(entry.offset + index.baseOffset, messageAndOffset.offset)
-        misMatchesForIndexFilesMap.put(file.getName, misMatchesSeq)
+        misMatchesForIndexFilesMap.put(file.getAbsolutePath, misMatchesSeq)
       }
       // since it is a sparse file, in the event of a crash there may be many zero entries, stop if we see one
       if(entry.offset == 0 && i > 0)
@@ -120,7 +120,7 @@ object DumpLogSegments {
                       isDeepIteration: Boolean) {
     val startOffset = file.getName().split("\\.")(0).toLong
     println("Starting offset: " + startOffset)
-    val messageSet = new FileMessageSet(file)
+    val messageSet = new FileMessageSet(file, false)
     var validBytes = 0L
     var lastOffset = -1l
     for(shallowMessageAndOffset <- messageSet) { // this only does shallow iteration
@@ -132,9 +132,9 @@ object DumpLogSegments {
           lastOffset = messageAndOffset.offset
         // If we are iterating uncompressed messages, offsets must be consecutive
         else if (msg.compressionCodec == NoCompressionCodec && messageAndOffset.offset != lastOffset +1) {
-          var nonConsecutivePairsSeq = nonConsecutivePairsForLogFilesMap.getOrElse(file.getName, List[(Long, Long)]())
+          var nonConsecutivePairsSeq = nonConsecutivePairsForLogFilesMap.getOrElse(file.getAbsolutePath, List[(Long, Long)]())
           nonConsecutivePairsSeq ::=(lastOffset, messageAndOffset.offset)
-          nonConsecutivePairsForLogFilesMap.put(file.getName, nonConsecutivePairsSeq)
+          nonConsecutivePairsForLogFilesMap.put(file.getAbsolutePath, nonConsecutivePairsSeq)
         }
         lastOffset = messageAndOffset.offset
 
@@ -146,7 +146,8 @@ object DumpLogSegments {
         if(printContents) {
           if(msg.hasKey)
             print(" key: " + Utils.readString(messageAndOffset.message.key, "UTF-8"))
-          print(" payload: " + Utils.readString(messageAndOffset.message.payload, "UTF-8"))
+          val payload = if(messageAndOffset.message.isNull) null else Utils.readString(messageAndOffset.message.payload, "UTF-8")
+          print(" payload: " + payload)
         }
         println()
       }

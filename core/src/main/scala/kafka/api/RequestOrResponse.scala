@@ -24,15 +24,24 @@ import kafka.utils.Logging
 object Request {
   val OrdinaryConsumerId: Int = -1
   val DebuggingConsumerId: Int = -2
+
+  // Followers use broker id as the replica id, which are non-negative int.
+  def isReplicaIdFromFollower(replicaId: Int): Boolean = (replicaId >= 0)
 }
 
 
-private[kafka] abstract class RequestOrResponse(val requestId: Option[Short] = None, val correlationId: Int) extends Logging{
+private[kafka] abstract class RequestOrResponse(val requestId: Option[Short] = None, val correlationId: Int) extends Logging {
 
   def sizeInBytes: Int
   
   def writeTo(buffer: ByteBuffer): Unit
 
   def handleError(e: Throwable, requestChannel: RequestChannel, request: RequestChannel.Request): Unit = {}
+
+  /* The purpose of this API is to return a string description of the Request mainly for the purpose of request logging.
+  *  This API has no meaning for a Response object.
+   * @param details If this is false, omit the parts of the request description that are proportional to the number of
+   *                topics or partitions. This is mainly to control the amount of request logging. */
+  def describe(details: Boolean):String
 }
 

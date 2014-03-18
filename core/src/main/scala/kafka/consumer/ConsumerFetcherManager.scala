@@ -18,9 +18,10 @@
 package kafka.consumer
 
 import org.I0Itec.zkclient.ZkClient
-import kafka.server.{AbstractFetcherThread, AbstractFetcherManager}
+import kafka.server.{BrokerAndInitialOffset, AbstractFetcherThread, AbstractFetcherManager}
 import kafka.cluster.{Cluster, Broker}
 import scala.collection.immutable
+import scala.collection.Map
 import collection.mutable.HashMap
 import scala.collection.mutable
 import java.util.concurrent.locks.ReentrantLock
@@ -40,7 +41,7 @@ class ConsumerFetcherManager(private val consumerIdString: String,
                              private val config: ConsumerConfig,
                              private val zkClient : ZkClient)
         extends AbstractFetcherManager("ConsumerFetcherManager-%d".format(SystemTime.milliseconds),
-                                       config.clientId, 1) {
+                                       config.clientId, config.numConsumerFetchers) {
   private var partitionMap: immutable.Map[TopicAndPartition, PartitionTopicInfo] = null
   private var cluster: Cluster = null
   private val noLeaderPartitionSet = new mutable.HashSet[TopicAndPartition]
@@ -90,23 +91,22 @@ class ConsumerFetcherManager(private val consumerIdString: String,
         lock.unlock()
       }
 
-      leaderForPartitionsMap.foreach {
-        case(topicAndPartition, leaderBroker) =>
-          val pti = partitionMap(topicAndPartition)
-          try {
-            addFetcher(topicAndPartition.topic, topicAndPartition.partition, pti.getFetchOffset(), leaderBroker)
-          } catch {
-            case t: Throwable => {
-                if (!isRunning.get())
-                  throw t /* If this thread is stopped, propagate this exception to kill the thread. */
-                else {
-                  warn("Failed to add leader for partition %s; will retry".format(topicAndPartition), t)
-                  lock.lock()
-                  noLeaderPartitionSet += topicAndPartition
-                  lock.unlock()
-                }
-              }
+      try {
+        addFetcherForPartitions(leaderForPartitionsMap.map{
+          case (topicAndPartition, broker) =>
+            topicAndPartition -> BrokerAndInitialOffset(broker, partitionMap(topicAndPartition).getFetchOffset())}
+        )
+      } catch {
+        case t: Throwable => {
+          if (!isRunning.get())
+            throw t /* If this thread is stopped, propagate this exception to kill the thread. */
+          else {
+            warn("Failed to add leader for partitions %s; will retry".format(leaderForPartitionsMap.keySet.mkString(",")), t)
+            lock.lock()
+            noLeaderPartitionSet ++= leaderForPartitionsMap.keySet
+            lock.unlock()
           }
+        }
       }
 
       shutdownIdleFetcherThreads()

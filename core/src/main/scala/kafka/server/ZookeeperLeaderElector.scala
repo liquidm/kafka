@@ -17,12 +17,12 @@
 package kafka.server
 
 import kafka.utils.ZkUtils._
-import kafka.utils.{Utils, SystemTime, Logging}
+import kafka.utils.Utils._
+import kafka.utils.{Json, SystemTime, Logging}
 import org.I0Itec.zkclient.exception.ZkNodeExistsException
 import org.I0Itec.zkclient.IZkDataListener
 import kafka.controller.ControllerContext
 import kafka.controller.KafkaController
-import kafka.common.KafkaException
 
 /**
  * This class handles zookeeper based leader election based on an ephemeral path. The election module does not handle
@@ -30,7 +30,10 @@ import kafka.common.KafkaException
  * leader is dead, this class will handle automatic re-election and if it succeeds, it invokes the leader state change
  * callback
  */
-class ZookeeperLeaderElector(controllerContext: ControllerContext, electionPath: String, onBecomingLeader: () => Unit,
+class ZookeeperLeaderElector(controllerContext: ControllerContext,
+                             electionPath: String,
+                             onBecomingLeader: () => Unit,
+                             onResigningAsLeader: () => Unit,
                              brokerId: Int)
   extends LeaderElector with Logging {
   var leaderId = -1
@@ -41,7 +44,7 @@ class ZookeeperLeaderElector(controllerContext: ControllerContext, electionPath:
   val leaderChangeListener = new LeaderChangeListener
 
   def startup {
-    controllerContext.controllerLock synchronized {
+    inLock(controllerContext.controllerLock) {
       controllerContext.zkClient.subscribeDataChanges(electionPath, leaderChangeListener)
       elect
     }
@@ -49,9 +52,7 @@ class ZookeeperLeaderElector(controllerContext: ControllerContext, electionPath:
 
   def elect: Boolean = {
     val timestamp = SystemTime.milliseconds.toString
-    val electString =
-      Utils.mergeJsonFields(Utils.mapToJsonFields(Map("version" -> 1.toString, "brokerid" -> brokerId.toString), valueInQuotes = false)
-        ++ Utils.mapToJsonFields(Map("timestamp" -> timestamp), valueInQuotes = true))
+    val electString = Json.encode(Map("version" -> 1, "brokerid" -> brokerId, "timestamp" -> timestamp))
 
     try {
       createEphemeralPathExpectConflictHandleZKBug(controllerContext.zkClient, electionPath, electString, brokerId,
@@ -60,23 +61,22 @@ class ZookeeperLeaderElector(controllerContext: ControllerContext, electionPath:
       info(brokerId + " successfully elected as leader")
       leaderId = brokerId
       onBecomingLeader()
-      } catch {
-        case e: ZkNodeExistsException =>
-          // If someone else has written the path, then
-          leaderId = readDataMaybeNull(controllerContext.zkClient, electionPath)._1 match {
-            case Some(controller) => KafkaController.parseControllerId(controller)
-            case None => {
-              warn("A leader has been elected but just resigned, this will result in another round of election")
-              -1
-            }
+    } catch {
+      case e: ZkNodeExistsException =>
+        // If someone else has written the path, then
+        leaderId = readDataMaybeNull(controllerContext.zkClient, electionPath)._1 match {
+          case Some(controller) => KafkaController.parseControllerId(controller)
+          case None => {
+            warn("A leader has been elected but just resigned, this will result in another round of election")
+            -1
           }
-          if (leaderId != -1)
-            debug("Broker %d was elected as leader instead of broker %d".format(leaderId, brokerId))
-        case e2: Throwable =>
-          error("Error while electing or becoming leader on broker %d".format(brokerId), e2)
-          leaderId = -1
+        }
+        if (leaderId != -1)
+          debug("Broker %d was elected as leader instead of broker %d".format(leaderId, brokerId))
+      case e2: Throwable =>
+        error("Error while electing or becoming leader on broker %d".format(brokerId), e2)
+        resign()
     }
-
     amILeader
   }
 
@@ -102,7 +102,7 @@ class ZookeeperLeaderElector(controllerContext: ControllerContext, electionPath:
      */
     @throws(classOf[Exception])
     def handleDataChange(dataPath: String, data: Object) {
-      controllerContext.controllerLock synchronized {
+      inLock(controllerContext.controllerLock) {
         leaderId = KafkaController.parseControllerId(data.toString)
         info("New leader is %d".format(leaderId))
       }
@@ -115,9 +115,11 @@ class ZookeeperLeaderElector(controllerContext: ControllerContext, electionPath:
      */
     @throws(classOf[Exception])
     def handleDataDeleted(dataPath: String) {
-      controllerContext.controllerLock synchronized {
+      inLock(controllerContext.controllerLock) {
         debug("%s leader change listener fired for path %s to handle data deleted: trying to elect as a leader"
           .format(brokerId, dataPath))
+        if(amILeader)
+          onResigningAsLeader()
         elect
       }
     }

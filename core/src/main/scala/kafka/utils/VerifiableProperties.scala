@@ -18,6 +18,7 @@
 package kafka.utils
 
 import java.util.Properties
+import java.util.Collections
 import scala.collection._
 
 class VerifiableProperties(val props: Properties) extends Logging {
@@ -38,10 +39,7 @@ class VerifiableProperties(val props: Properties) extends Logging {
   /**
    * Read a required integer property value or throw an exception if no such property is found
    */
-  def getInt(name: String): Int = {
-    require(containsKey(name), "Missing required property '" + name + "'")
-    return getInt(name, -1)
-  }
+  def getInt(name: String): Int = getString(name).toInt
 
   def getIntInRange(name: String, range: (Int, Int)): Int = {
     require(containsKey(name), "Missing required property '" + name + "'")
@@ -92,10 +90,7 @@ class VerifiableProperties(val props: Properties) extends Logging {
   /**
    * Read a required long property value or throw an exception if no such property is found
    */
-  def getLong(name: String): Long = {
-    require(containsKey(name), "Missing required property '" + name + "'")
-    return getLong(name, -1)
-  }
+  def getLong(name: String): Long = getString(name).toLong
 
   /**
    * Read an long from the properties instance
@@ -124,6 +119,26 @@ class VerifiableProperties(val props: Properties) extends Logging {
     require(v >= range._1 && v <= range._2, name + " has value " + v + " which is not in the range " + range + ".")
     v
   }
+  
+  /**
+   * Get a required argument as a double
+   * @param name The property name
+   * @return the value
+   * @throw IllegalArgumentException If the given property is not present
+   */
+  def getDouble(name: String): Double = getString(name).toDouble
+  
+  /**
+   * Get an optional argument as a double
+   * @param name The property name
+   * @default The default value for the property if not present
+   */
+  def getDouble(name: String, default: Double): Double = {
+    if(containsKey(name))
+      getDouble(name)
+    else
+      default
+  } 
 
   /**
    * Read a boolean value from the properties instance
@@ -140,6 +155,8 @@ class VerifiableProperties(val props: Properties) extends Logging {
       v.toBoolean
     }
   }
+  
+  def getBoolean(name: String) = getString(name).toBoolean
 
   /**
    * Get a string property, or, if no such property is defined, return the given default value
@@ -162,7 +179,7 @@ class VerifiableProperties(val props: Properties) extends Logging {
   /**
    * Get a Map[String, String] from a property list in the form k1:v2, k2:v2, ...
    */
-  def getMap(name: String, valid: String => Boolean): Map[String, String] = {
+  def getMap(name: String, valid: String => Boolean = s => true): Map[String, String] = {
     try {
       val m = Utils.parseCsvMap(getString(name, ""))
       m.foreach {
@@ -178,10 +195,12 @@ class VerifiableProperties(val props: Properties) extends Logging {
 
   def verify() {
     info("Verifying properties")
-    val specifiedProperties = props.propertyNames()
-    while (specifiedProperties.hasMoreElements) {
-      val key = specifiedProperties.nextElement().asInstanceOf[String]
-      if (!referenceSet.contains(key))
+    val propNames = {
+      import JavaConversions._
+      Collections.list(props.propertyNames).map(_.toString).sorted
+    }
+    for(key <- propNames) {
+      if (!referenceSet.contains(key) && !key.startsWith("external"))
         warn("Property %s is not valid".format(key))
       else
         info("Property %s is overridden to %s".format(key, props.getProperty(key)))
@@ -189,4 +208,5 @@ class VerifiableProperties(val props: Properties) extends Logging {
   }
   
   override def toString(): String = props.toString
+ 
 }

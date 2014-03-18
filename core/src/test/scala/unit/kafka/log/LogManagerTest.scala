@@ -24,34 +24,37 @@ import org.scalatest.junit.JUnit3Suite
 import kafka.server.KafkaConfig
 import kafka.common._
 import kafka.utils._
+import kafka.server.OffsetCheckpoint
 
 class LogManagerTest extends JUnit3Suite {
 
   val time: MockTime = new MockTime()
   val maxRollInterval = 100
-  val maxLogAgeHours = 10
+  val maxLogAgeMs = 10*60*60*1000
+  val logConfig = LogConfig(segmentSize = 1024, maxIndexSize = 4096, retentionMs = maxLogAgeMs)
   var logDir: File = null
   var logManager: LogManager = null
-  var config: KafkaConfig = null
   val name = "kafka"
   val veryLargeLogFlushInterval = 10000000L
-  val scheduler = new KafkaScheduler(2)
+  val cleanerConfig = CleanerConfig(enableCleaner = false)
 
   override def setUp() {
     super.setUp()
-    config = new KafkaConfig(TestUtils.createBrokerConfig(0, -1)) {
-                   override val logSegmentBytes = 1024
-                   override val logFlushIntervalMessages = 10000
-                   override val logRetentionHours = maxLogAgeHours
-                 }
-    scheduler.startup
-    logManager = new LogManager(config, scheduler, time)
+    logDir = TestUtils.tempDir()
+    logManager = new LogManager(logDirs = Array(logDir), 
+                                topicConfigs = Map(), 
+                                defaultConfig = logConfig, 
+                                cleanerConfig = cleanerConfig, 
+                                flushCheckMs = 1000L, 
+                                flushCheckpointMs = 100000L, 
+                                retentionCheckMs = 1000L, 
+                                scheduler = time.scheduler, 
+                                time = time)
     logManager.startup
     logDir = logManager.logDirs(0)
   }
 
   override def tearDown() {
-    scheduler.shutdown()
     if(logManager != null)
       logManager.shutdown()
     Utils.rm(logDir)
@@ -59,41 +62,48 @@ class LogManagerTest extends JUnit3Suite {
     super.tearDown()
   }
   
+  /**
+   * Test that getOrCreateLog on a non-existent log creates a new log and that we can append to the new log.
+   */
   @Test
   def testCreateLog() {
-    val log = logManager.getOrCreateLog(name, 0)
-    val logFile = new File(config.logDirs(0), name + "-0")
+    val log = logManager.createLog(TopicAndPartition(name, 0), logConfig)
+    val logFile = new File(logDir, name + "-0")
     assertTrue(logFile.exists)
     log.append(TestUtils.singleMessageSet("test".getBytes()))
   }
 
+  /**
+   * Test that get on a non-existent returns None and no log is created.
+   */
   @Test
-  def testGetLog() {
-    val log = logManager.getLog(name, 0)
-    val logFile = new File(config.logDirs(0), name + "-0")
+  def testGetNonExistentLog() {
+    val log = logManager.getLog(TopicAndPartition(name, 0))
+    assertEquals("No log should be found.", None, log)
+    val logFile = new File(logDir, name + "-0")
     assertTrue(!logFile.exists)
   }
 
+  /**
+   * Test time-based log cleanup. First append messages, then set the time into the future and run cleanup.
+   */
   @Test
   def testCleanupExpiredSegments() {
-    val log = logManager.getOrCreateLog(name, 0)
+    val log = logManager.createLog(TopicAndPartition(name, 0), logConfig)
     var offset = 0L
-    for(i <- 0 until 1000) {
+    for(i <- 0 until 200) {
       var set = TestUtils.singleMessageSet("test".getBytes())
-      val (start, end) = log.append(set)
-      offset = end
+      val info = log.append(set)
+      offset = info.lastOffset
     }
-    log.flush
-
     assertTrue("There should be more than one segment now.", log.numberOfSegments > 1)
-
-    // update the last modified time of all log segments
-    val logSegments = log.segments.view
-    logSegments.foreach(_.messageSet.file.setLastModified(time.currentMs))
-
-    time.currentMs += maxLogAgeHours*60*60*1000 + 1
-    logManager.cleanupLogs()
-    assertEquals("Now there should only be only one segment.", 1, log.numberOfSegments)
+    
+    log.logSegments.foreach(_.log.file.setLastModified(time.milliseconds))
+    
+    time.sleep(maxLogAgeMs + 1)
+    assertEquals("Now there should only be only one segment in the index.", 1, log.numberOfSegments)
+    time.sleep(log.config.fileDeleteDelayMs + 1)
+    assertEquals("Files should have been deleted", log.numberOfSegments * 2, log.dir.list.length)
     assertEquals("Should get empty fetch off new log.", 0, log.read(offset+1, 1024).sizeInBytes)
 
     try {
@@ -106,42 +116,37 @@ class LogManagerTest extends JUnit3Suite {
     log.append(TestUtils.singleMessageSet("test".getBytes()))
   }
 
+  /**
+   * Test size-based cleanup. Append messages, then run cleanup and check that segments are deleted.
+   */
   @Test
   def testCleanupSegmentsToMaintainSize() {
     val setSize = TestUtils.singleMessageSet("test".getBytes()).sizeInBytes
-    val retentionHours = 1
-    val retentionMs = 1000 * 60 * 60 * retentionHours
-    val props = TestUtils.createBrokerConfig(0, -1)
     logManager.shutdown()
-    config = new KafkaConfig(props) {
-      override val logSegmentBytes = (10 * (setSize - 1)) // each segment will be 10 messages
-      override val logRetentionBytes = (5 * 10 * setSize + 10).asInstanceOf[Long]
-      override val logRetentionHours = retentionHours
-      override val logFlushIntervalMessages = 100
-      override val logRollHours = maxRollInterval
-    }
-    logManager = new LogManager(config, scheduler, time)
+
+    val config = logConfig.copy(segmentSize = 10 * (setSize - 1), retentionSize = 5L * 10L * setSize + 10L)
+    logManager = new LogManager(Array(logDir), Map(), config, cleanerConfig, 1000L, 100000L, 1000L, time.scheduler, time)
     logManager.startup
 
     // create a log
-    val log = logManager.getOrCreateLog(name, 0)
+    val log = logManager.createLog(TopicAndPartition(name, 0), config)
     var offset = 0L
 
     // add a bunch of messages that should be larger than the retentionSize
-    for(i <- 0 until 1000) {
+    val numMessages = 200
+    for(i <- 0 until numMessages) {
       val set = TestUtils.singleMessageSet("test".getBytes())
-      val (start, end) = log.append(set)
-      offset = start
+      val info = log.append(set)
+      offset = info.firstOffset
     }
-    // flush to make sure it's written to disk
-    log.flush
 
-    // should be exactly 100 full segments + 1 new empty one
-    assertEquals("There should be example 100 segments.", 100, log.numberOfSegments)
+    assertEquals("Check we have the expected number of segments.", numMessages * setSize / config.segmentSize, log.numberOfSegments)
 
     // this cleanup shouldn't find any expired segments but should delete some to reduce size
-    logManager.cleanupLogs()
+    time.sleep(logManager.InitialTaskDelayMs)
     assertEquals("Now there should be exactly 6 segments", 6, log.numberOfSegments)
+    time.sleep(log.config.fileDeleteDelayMs + 1)
+    assertEquals("Files should have been deleted", log.numberOfSegments * 2, log.dir.list.length)
     assertEquals("Should get empty fetch off new log.", 0, log.read(offset + 1, 1024).sizeInBytes)
     try {
       log.read(0, 1024)
@@ -153,55 +158,75 @@ class LogManagerTest extends JUnit3Suite {
     log.append(TestUtils.singleMessageSet("test".getBytes()))
   }
 
+  /**
+   * Test that flush is invoked by the background scheduler thread.
+   */
   @Test
   def testTimeBasedFlush() {
-    val props = TestUtils.createBrokerConfig(0, -1)
     logManager.shutdown()
-    config = new KafkaConfig(props) {
-                   override val logSegmentBytes = 1024 *1024 *1024
-                   override val logFlushSchedulerIntervalMs = 50
-                   override val logFlushIntervalMessages = Int.MaxValue
-                   override val logRollHours = maxRollInterval
-                   override val logFlushIntervalMsPerTopicMap = Map("timebasedflush" -> 100)
-                 }
-    logManager = new LogManager(config, scheduler, time)
+    val config = logConfig.copy(flushMs = 1000)
+    logManager = new LogManager(Array(logDir), Map(), config, cleanerConfig, 1000L, 10000L, 1000L, time.scheduler, time)
     logManager.startup
-    val log = logManager.getOrCreateLog(name, 0)
+    val log = logManager.createLog(TopicAndPartition(name, 0), config)
+    val lastFlush = log.lastFlushTime
     for(i <- 0 until 200) {
       var set = TestUtils.singleMessageSet("test".getBytes())
       log.append(set)
     }
-    val ellapsed = System.currentTimeMillis - log.getLastFlushedTime
-    assertTrue("The last flush time has to be within defaultflushInterval of current time (was %d)".format(ellapsed),
-                     ellapsed < 2*config.logFlushSchedulerIntervalMs)
+    time.sleep(logManager.InitialTaskDelayMs)
+    assertTrue("Time based flush should have been triggered triggered", lastFlush != log.lastFlushTime)
   }
   
+  /**
+   * Test that new logs that are created are assigned to the least loaded log directory
+   */
   @Test
   def testLeastLoadedAssignment() {
     // create a log manager with multiple data directories
-    val props = TestUtils.createBrokerConfig(0, -1)
-    val dirs = Seq(TestUtils.tempDir().getAbsolutePath, 
-                   TestUtils.tempDir().getAbsolutePath, 
-                   TestUtils.tempDir().getAbsolutePath)
-    props.put("log.dirs", dirs.mkString(","))
+    val dirs = Array(TestUtils.tempDir(), 
+                     TestUtils.tempDir(), 
+                     TestUtils.tempDir())
     logManager.shutdown()
-    logManager = new LogManager(new KafkaConfig(props), scheduler, time)
+    logManager = new LogManager(dirs, Map(), logConfig, cleanerConfig, 1000L, 10000L, 1000L, time.scheduler, time)
     
     // verify that logs are always assigned to the least loaded partition
     for(partition <- 0 until 20) {
-      logManager.getOrCreateLog("test", partition)
+      logManager.createLog(TopicAndPartition("test", partition), logConfig)
       assertEquals("We should have created the right number of logs", partition + 1, logManager.allLogs.size)
       val counts = logManager.allLogs.groupBy(_.dir.getParent).values.map(_.size)
       assertTrue("Load should balance evenly", counts.max <= counts.min + 1)
     }
   }
   
+  /**
+   * Test that it is not possible to open two log managers using the same data directory
+   */
   def testTwoLogManagersUsingSameDirFails() {
     try {
-      new LogManager(logManager.config, scheduler, time)
+      new LogManager(Array(logDir), Map(), logConfig, cleanerConfig, 1000L, 10000L, 1000L, time.scheduler, time)
       fail("Should not be able to create a second log manager instance with the same data directory")
     } catch {
       case e: KafkaException => // this is good 
     }
+  }
+  
+  /**
+   * Test that recovery points are correctly written out to disk
+   */
+  def testCheckpointRecoveryPoints() {
+    val topicA = TopicAndPartition("test-a", 1)
+    val topicB = TopicAndPartition("test-b", 1)
+    val logA = this.logManager.createLog(topicA, logConfig)
+    val logB = this.logManager.createLog(topicB, logConfig)
+    for(i <- 0 until 50) 
+      logA.append(TestUtils.singleMessageSet("test".getBytes()))
+    for(i <- 0 until 100)
+      logB.append(TestUtils.singleMessageSet("test".getBytes()))
+    logA.flush()
+    logB.flush()
+    logManager.checkpointRecoveryPointOffsets()
+    val checkpoints = new OffsetCheckpoint(new File(logDir, logManager.RecoveryPointCheckpointFile)).read()
+    assertEquals("Recovery point should equal checkpoint", checkpoints(topicA), logA.recoveryPoint)
+    assertEquals("Recovery point should equal checkpoint", checkpoints(topicB), logB.recoveryPoint)
   }
 }

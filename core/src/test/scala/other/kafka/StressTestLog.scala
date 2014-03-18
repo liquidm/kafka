@@ -32,15 +32,14 @@ object StressTestLog {
   
   def main(args: Array[String]) {
     val dir = TestUtils.tempDir()
-    val log = new Log(dir, 
-                      maxLogFileSize = 64*1024*1024, 
-                      maxMessageSize = Int.MaxValue, 
-                      flushInterval = Int.MaxValue, 
-                      rollIntervalMs = Long.MaxValue, 
-                      needsRecovery = false,
-                      maxIndexSize = 1024*1024,
-                      time = SystemTime,
-                      brokerId = 0)
+    val time = new MockTime
+    val log = new Log(dir = dir,
+                      config = LogConfig(segmentSize = 64*1024*1024,
+                                         maxMessageSize = Int.MaxValue,
+                                         maxIndexSize = 1024*1024),
+                      recoveryPoint = 0L,
+                      scheduler = time.scheduler,
+                      time = time)
     val writer = new WriterThread(log)
     writer.start()
     val reader = new ReaderThread(log)
@@ -80,8 +79,8 @@ object StressTestLog {
   class WriterThread(val log: Log) extends WorkerThread {
     @volatile var offset = 0
     override def work() {
-      val offsets = log.append(TestUtils.singleMessageSet(offset.toString.getBytes))
-      require(offsets._1 == offset && offsets._2 == offset)
+      val logAppendInfo = log.append(TestUtils.singleMessageSet(offset.toString.getBytes))
+      require(logAppendInfo.firstOffset == offset && logAppendInfo.lastOffset == offset)
       offset += 1
       if(offset % 1000 == 0)
         Thread.sleep(500)

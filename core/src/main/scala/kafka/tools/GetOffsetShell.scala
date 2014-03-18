@@ -20,7 +20,6 @@ package kafka.tools
 
 import kafka.consumer._
 import joptsimple._
-import java.net.URI
 import kafka.api.{PartitionOffsetRequestInfo, OffsetRequest}
 import kafka.common.TopicAndPartition
 import kafka.client.ClientUtils

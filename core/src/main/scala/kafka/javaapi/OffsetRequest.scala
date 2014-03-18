@@ -28,8 +28,10 @@ class OffsetRequest(requestInfo: java.util.Map[TopicAndPartition, PartitionOffse
                     clientId: String) {
 
   val underlying = {
-    import collection.JavaConversions._
-    val scalaMap = (requestInfo: mutable.Map[TopicAndPartition, PartitionOffsetRequestInfo]).toMap
+    val scalaMap = {
+      import collection.JavaConversions._
+      (requestInfo: mutable.Map[TopicAndPartition, PartitionOffsetRequestInfo]).toMap
+    }
     kafka.api.OffsetRequest(
       requestInfo = scalaMap,
       versionId = versionId,
@@ -38,11 +40,6 @@ class OffsetRequest(requestInfo: java.util.Map[TopicAndPartition, PartitionOffse
     )
   }
 
-
-  def writeTo(buffer: ByteBuffer) { underlying.writeTo(buffer) }
-
-
-  def sizeInBytes = underlying.sizeInBytes
 
 
   override def toString = underlying.toString

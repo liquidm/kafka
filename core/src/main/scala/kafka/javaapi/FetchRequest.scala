@@ -28,10 +28,11 @@ class FetchRequest(correlationId: Int,
                    minBytes: Int,
                    requestInfo: java.util.Map[TopicAndPartition, PartitionFetchInfo]) {
 
-  import scala.collection.JavaConversions._
-
   val underlying = {
-    val scalaMap = (requestInfo: mutable.Map[TopicAndPartition, PartitionFetchInfo]).toMap
+    val scalaMap: Map[TopicAndPartition, PartitionFetchInfo] = {
+      import scala.collection.JavaConversions._
+      (requestInfo: mutable.Map[TopicAndPartition, PartitionFetchInfo]).toMap
+    }
     kafka.api.FetchRequest(
       correlationId = correlationId,
       clientId = clientId,
@@ -41,10 +42,6 @@ class FetchRequest(correlationId: Int,
       requestInfo = scalaMap
     )
   }
-
-  def writeTo(buffer: ByteBuffer) { underlying.writeTo(buffer) }
-
-  def sizeInBytes = underlying.sizeInBytes
 
   override def toString = underlying.toString
 

@@ -23,6 +23,7 @@ import java.nio._
 import java.nio.channels._
 import java.util.Random
 import java.util.Properties
+import junit.framework.AssertionFailedError
 import junit.framework.Assert._
 import kafka.server._
 import kafka.producer._
@@ -45,6 +46,8 @@ import junit.framework.Assert
  * Utility functions to help with testing
  */
 object TestUtils extends Logging {
+  
+  val IoTmpDir = System.getProperty("java.io.tmpdir")
 
   val Letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
   val Digits = "0123456789"
@@ -76,8 +79,7 @@ object TestUtils extends Logging {
    * Create a temporary directory
    */
   def tempDir(): File = {
-    val ioDir = System.getProperty("java.io.tmpdir")
-    val f = new File(ioDir, "kafka-" + random.nextInt(1000000))
+    val f = new File(IoTmpDir, "kafka-" + random.nextInt(1000000))
     f.mkdirs()
     f.deleteOnExit()
     f
@@ -123,13 +125,12 @@ object TestUtils extends Logging {
   /**
    * Create a test config for the given node id
    */
-  def createBrokerConfig(nodeId: Int, port: Int): Properties = {
+  def createBrokerConfig(nodeId: Int, port: Int = choosePort()): Properties = {
     val props = new Properties
     props.put("broker.id", nodeId.toString)
     props.put("host.name", "localhost")
     props.put("port", port.toString)
     props.put("log.dir", TestUtils.tempDir().getAbsolutePath)
-    props.put("log.flush.interval.messages", "1")
     props.put("zookeeper.connect", TestZKUtils.zookeeperConnect)
     props.put("replica.socket.timeout.ms", "1500")
     props
@@ -150,6 +151,7 @@ object TestUtils extends Logging {
     props.put("auto.commit.interval.ms", "1000")
     props.put("rebalance.max.retries", "4")
     props.put("auto.offset.reset", "smallest")
+    props.put("num.consumer.fetchers", "2")
 
     props
   }
@@ -158,8 +160,8 @@ object TestUtils extends Logging {
    * Wrap the message in a message set
    * @param payload The bytes of the message
    */
-  def singleMessageSet(payload: Array[Byte], codec: CompressionCodec = NoCompressionCodec) =
-    new ByteBufferMessageSet(compressionCodec = codec, messages = new Message(payload))
+  def singleMessageSet(payload: Array[Byte], codec: CompressionCodec = NoCompressionCodec, key: Array[Byte] = null) =
+    new ByteBufferMessageSet(compressionCodec = codec, messages = new Message(payload, key))
 
   /**
    * Generate an array of random bytes
@@ -448,17 +450,23 @@ object TestUtils extends Logging {
    * Execute the given block. If it throws an assert error, retry. Repeat
    * until no error is thrown or the time limit ellapses
    */
-  def retry(waitTime: Long, block: () => Unit) {
+  def retry(maxWaitMs: Long)(block: => Unit) {
+    var wait = 1L
     val startTime = System.currentTimeMillis()
     while(true) {
       try {
-        block()
+        block
+        return
       } catch {
-        case e: AssertionError =>
-          if(System.currentTimeMillis - startTime > waitTime)
+        case e: AssertionFailedError =>
+          val ellapsed = System.currentTimeMillis - startTime 
+          if(ellapsed > maxWaitMs) {
             throw e
-          else
-            Thread.sleep(100)
+          } else {
+            info("Attempt failed, sleeping for " + wait + ", and then retrying.")
+            Thread.sleep(wait)
+            wait += math.min(wait, 1000)
+          }
       }
     }
   }
@@ -503,31 +511,69 @@ object TestUtils extends Logging {
   def waitUntilMetadataIsPropagated(servers: Seq[KafkaServer], topic: String, partition: Int, timeout: Long) = {
     Assert.assertTrue("Partition [%s,%d] metadata not propagated after timeout".format(topic, partition),
       TestUtils.waitUntilTrue(() =>
-        servers.foldLeft(true)(_ && _.apis.leaderCache.keySet.contains(TopicAndPartition(topic, partition))), timeout))
+        servers.foldLeft(true)(_ && _.apis.metadataCache.keySet.contains(TopicAndPartition(topic, partition))), timeout))
   }
   
+  def writeNonsenseToFile(fileName: File, position: Long, size: Int) {
+    val file = new RandomAccessFile(fileName, "rw")
+    file.seek(position)
+    for(i <- 0 until size)
+      file.writeByte(random.nextInt(255))
+    file.close()
+  }
+  
+  def appendNonsenseToFile(fileName: File, size: Int) {
+    val file = new FileOutputStream(fileName, true)
+    for(i <- 0 until size)
+      file.write(random.nextInt(255))
+    file.close()
+  }
+
+  def checkForPhantomInSyncReplicas(zkClient: ZkClient, topic: String, partitionToBeReassigned: Int, assignedReplicas: Seq[Int]) {
+    val inSyncReplicas = ZkUtils.getInSyncReplicasForPartition(zkClient, topic, partitionToBeReassigned)
+    // in sync replicas should not have any replica that is not in the new assigned replicas
+    val phantomInSyncReplicas = inSyncReplicas.toSet -- assignedReplicas.toSet
+    assertTrue("All in sync replicas %s must be in the assigned replica list %s".format(inSyncReplicas, assignedReplicas),
+      phantomInSyncReplicas.size == 0)
+  }
+
+  def ensureNoUnderReplicatedPartitions(zkClient: ZkClient, topic: String, partitionToBeReassigned: Int, assignedReplicas: Seq[Int],
+                                                servers: Seq[KafkaServer]) {
+    val inSyncReplicas = ZkUtils.getInSyncReplicasForPartition(zkClient, topic, partitionToBeReassigned)
+    assertFalse("Reassigned partition [%s,%d] is underreplicated".format(topic, partitionToBeReassigned),
+      inSyncReplicas.size < assignedReplicas.size)
+    val leader = ZkUtils.getLeaderForPartition(zkClient, topic, partitionToBeReassigned)
+    assertTrue("Reassigned partition [%s,%d] is unavailable".format(topic, partitionToBeReassigned), leader.isDefined)
+    val leaderBroker = servers.filter(s => s.config.brokerId == leader.get).head
+    assertTrue("Reassigned partition [%s,%d] is underreplicated as reported by the leader %d".format(topic, partitionToBeReassigned, leader.get),
+      leaderBroker.replicaManager.underReplicatedPartitionCount() == 0)
+  }
+
+  def checkIfReassignPartitionPathExists(zkClient: ZkClient): Boolean = {
+    ZkUtils.pathExists(zkClient, ZkUtils.ReassignPartitionsPath)
+  }
 }
 
 object TestZKUtils {
-  val zookeeperConnect = "127.0.0.1:2182"
+  val zookeeperConnect = "127.0.0.1:" + TestUtils.choosePort()
 }
 
 class IntEncoder(props: VerifiableProperties = null) extends Encoder[Int] {
   override def toBytes(n: Int) = n.toString.getBytes
 }
 
-class StaticPartitioner(props: VerifiableProperties = null) extends Partitioner[String] {
-  def partition(data: String, numPartitions: Int): Int = {
-    (data.length % numPartitions)
+class StaticPartitioner(props: VerifiableProperties = null) extends Partitioner{
+  def partition(data: Any, numPartitions: Int): Int = {
+    (data.asInstanceOf[String].length % numPartitions)
   }
 }
 
-class HashPartitioner(props: VerifiableProperties = null) extends Partitioner[String] {
-  def partition(data: String, numPartitions: Int): Int = {
+class HashPartitioner(props: VerifiableProperties = null) extends Partitioner {
+  def partition(data: Any, numPartitions: Int): Int = {
     (data.hashCode % numPartitions)
   }
 }
 
-class FixedValuePartitioner(props: VerifiableProperties = null) extends Partitioner[Int] {
-  def partition(data: Int, numPartitions: Int): Int = data
+class FixedValuePartitioner(props: VerifiableProperties = null) extends Partitioner {
+  def partition(data: Any, numPartitions: Int): Int = data.asInstanceOf[Int]
 }

@@ -31,6 +31,17 @@ class KafkaConfig private (val props: VerifiableProperties) extends ZKConfig(pro
     this(new VerifiableProperties(originalProps))
     props.verify()
   }
+  
+  private def getLogRetentionTimeMillis(): Long = {
+    var millisInMinute = 60L * 1000L
+    val millisInHour = 60L * millisInMinute
+    if(props.containsKey("log.retention.minutes")){
+       millisInMinute * props.getIntInRange("log.retention.minutes", (1, Int.MaxValue))
+    } else {
+       millisInHour * props.getIntInRange("log.retention.hours", 24*7, (1, Int.MaxValue))
+    }
+    
+  }
 
   /*********** General Configuration ***********/
   
@@ -46,6 +57,9 @@ class KafkaConfig private (val props: VerifiableProperties) extends ZKConfig(pro
   /* the number of io threads that the server uses for carrying out network requests */
   val numIoThreads = props.getIntInRange("num.io.threads", 8, (1, Int.MaxValue))
   
+  /* the number of threads to use for various background processing tasks */
+  val backgroundThreads = props.getIntInRange("background.threads", 4, (1, Int.MaxValue))
+  
   /* the number of queued requests allowed before blocking the network threads */
   val queuedMaxRequests = props.getIntInRange("queued.max.requests", 500, (1, Int.MaxValue))
   
@@ -55,8 +69,19 @@ class KafkaConfig private (val props: VerifiableProperties) extends ZKConfig(pro
   val port: Int = props.getInt("port", 6667)
 
   /* hostname of broker. If this is set, it will only bind to this address. If this is not set,
-   * it will bind to all interfaces, and publish one to ZK */
+   * it will bind to all interfaces */
   val hostName: String = props.getString("host.name", null)
+  
+  /* hostname to publish to ZooKeeper for clients to use. In IaaS environments, this may
+   * need to be different from the interface to which the broker binds. If this is not set,
+   * it will use the value for "host.name" if configured. Otherwise
+   * it will use the value returned from java.net.InetAddress.getCanonicalHostName(). */
+  val advertisedHostName: String = props.getString("advertised.host.name", hostName)
+    
+  /* the port to publish to ZooKeeper for clients to use. In IaaS environments, this may
+   * need to be different from the port to which the broker binds. If this is not set,
+   * it will publish the same port that the broker binds to. */
+  val advertisedPort: Int = props.getInt("advertised.port", port)
 
   /* the SO_SNDBUFF buffer of the socket sever sockets */
   val socketSendBufferBytes: Int = props.getInt("socket.send.buffer.bytes", 100*1024)
@@ -79,29 +104,49 @@ class KafkaConfig private (val props: VerifiableProperties) extends ZKConfig(pro
   /* the maximum size of a single log file */
   val logSegmentBytes = props.getIntInRange("log.segment.bytes", 1*1024*1024*1024, (Message.MinHeaderSize, Int.MaxValue))
 
-  /* the maximum size of a single log file for some specific topic */
-  val logSegmentBytesPerTopicMap = props.getMap("log.segment.bytes.per.topic", _.toInt > 0).mapValues(_.toInt)
-
   /* the maximum time before a new log segment is rolled out */
   val logRollHours = props.getIntInRange("log.roll.hours", 24*7, (1, Int.MaxValue))
 
-  /* the number of hours before rolling out a new log segment for some specific topic */
-  val logRollHoursPerTopicMap = props.getMap("log.roll.hours.per.topic", _.toInt > 0).mapValues(_.toInt)
-
   /* the number of hours to keep a log file before deleting it */
-  val logRetentionHours = props.getIntInRange("log.retention.hours", 24*7, (1, Int.MaxValue))
-
-  /* the number of hours to keep a log file before deleting it for some specific topic*/
-  val logRetentionHoursPerTopicMap = props.getMap("log.retention.hours.per.topic", _.toInt > 0).mapValues(_.toInt)
+  val logRetentionTimeMillis = getLogRetentionTimeMillis
 
   /* the maximum size of the log before deleting it */
   val logRetentionBytes = props.getLong("log.retention.bytes", -1)
 
-  /* the maximum size of the log for some specific topic before deleting it */
-  val logRetentionBytesPerTopicMap = props.getMap("log.retention.bytes.per.topic", _.toLong > 0).mapValues(_.toLong)
-
   /* the frequency in minutes that the log cleaner checks whether any log is eligible for deletion */
-  val logCleanupIntervalMins = props.getIntInRange("log.cleanup.interval.mins", 10, (1, Int.MaxValue))
+  val logCleanupIntervalMs = props.getLongInRange("log.retention.check.interval.ms", 5*60*1000, (1, Long.MaxValue))
+  
+  /* the default cleanup policy for segments beyond the retention window, must be either "delete" or "dedupe" */
+  val logCleanupPolicy = props.getString("log.cleanup.policy", "delete")
+  
+  /* the number of background threads to use for log cleaning */
+  val logCleanerThreads = props.getIntInRange("log.cleaner.threads", 1, (0, Int.MaxValue))
+  
+  /* the log cleaner will be throttled so that the sum of its read and write i/o will be less than this value on average */
+  val logCleanerIoMaxBytesPerSecond = props.getDouble("log.cleaner.io.max.bytes.per.second", Double.MaxValue)
+  
+  /* the total memory used for log deduplication across all cleaner threads */
+  val logCleanerDedupeBufferSize = props.getLongInRange("log.cleaner.dedupe.buffer.size", 500*1024*1024L, (0, Long.MaxValue))
+  require(logCleanerDedupeBufferSize / logCleanerThreads > 1024*1024, "log.cleaner.dedupe.buffer.size must be at least 1MB per cleaner thread.")
+  
+  /* the total memory used for log cleaner I/O buffers across all cleaner threads */
+  val logCleanerIoBufferSize = props.getIntInRange("log.cleaner.io.buffer.size", 512*1024, (0, Int.MaxValue))
+  
+  /* log cleaner dedupe buffer load factor. The percentage full the dedupe buffer can become. A higher value
+   * will allow more log to be cleaned at once but will lead to more hash collisions */
+  val logCleanerDedupeBufferLoadFactor = props.getDouble("log.cleaner.io.buffer.load.factor", 0.9d)
+  
+  /* the amount of time to sleep when there are no logs to clean */
+  val logCleanerBackoffMs = props.getLongInRange("log.cleaner.backoff.ms", 15*1000, (0L, Long.MaxValue))
+  
+  /* the minimum ratio of dirty log to total log for a log to eligible for cleaning */
+  val logCleanerMinCleanRatio = props.getDouble("log.cleaner.min.cleanable.ratio", 0.5)
+  
+  /* should we enable log cleaning? */
+  val logCleanerEnable = props.getBoolean("log.cleaner.enable", false)
+  
+  /* how long are delete records retained? */
+  val logCleanerDeleteRetentionMs = props.getLong("log.cleaner.delete.retention.ms", 24 * 60 * 60 * 1000L)
   
   /* the maximum size in bytes of the offset index */
   val logIndexSizeMaxBytes = props.getIntInRange("log.index.size.max.bytes", 10*1024*1024, (4, Int.MaxValue))
@@ -110,16 +155,19 @@ class KafkaConfig private (val props: VerifiableProperties) extends ZKConfig(pro
   val logIndexIntervalBytes = props.getIntInRange("log.index.interval.bytes", 4096, (0, Int.MaxValue))
 
   /* the number of messages accumulated on a log partition before messages are flushed to disk */
-  val logFlushIntervalMessages = props.getIntInRange("log.flush.interval.messages", 10000, (1, Int.MaxValue))
+  val logFlushIntervalMessages = props.getLongInRange("log.flush.interval.messages", Long.MaxValue, (1, Long.MaxValue))
 
-  /* the maximum time in ms that a message in selected topics is kept in memory before flushed to disk, e.g., topic1:3000,topic2: 6000  */
-  val logFlushIntervalMsPerTopicMap = props.getMap("log.flush.interval.ms.per.topic", _.toInt > 0).mapValues(_.toInt)
+  /* the amount of time to wait before deleting a file from the filesystem */
+  val logDeleteDelayMs = props.getLongInRange("log.segment.delete.delay.ms", 60000, (0, Long.MaxValue))
 
   /* the frequency in ms that the log flusher checks whether any log needs to be flushed to disk */
-  val logFlushSchedulerIntervalMs = props.getInt("log.flush.scheduler.interval.ms",  3000)
+  val logFlushSchedulerIntervalMs = props.getLong("log.flush.scheduler.interval.ms",  Long.MaxValue)
 
   /* the maximum time in ms that a message in any topic is kept in memory before flushed to disk */
-  val logFlushIntervalMs = props.getInt("log.flush.interval.ms", logFlushSchedulerIntervalMs)
+  val logFlushIntervalMs = props.getLong("log.flush.interval.ms", logFlushSchedulerIntervalMs)
+  
+  /* the frequency with which we update the persistent record of the last flush which acts as the log recovery point */
+  val logFlushOffsetCheckpointIntervalMs = props.getIntInRange("log.flush.offset.checkpoint.interval.ms", 60000, (0, Int.MaxValue))
 
   /* enable auto creation of topic on the server */
   val autoCreateTopicsEnable = props.getBoolean("auto.create.topics.enable", true)
@@ -148,10 +196,13 @@ class KafkaConfig private (val props: VerifiableProperties) extends ZKConfig(pro
   val replicaSocketReceiveBufferBytes = props.getInt("replica.socket.receive.buffer.bytes", ConsumerConfig.SocketBufferSize)
 
   /* the number of byes of messages to attempt to fetch */
-  val replicaFetchMaxBytes = props.getInt("replica.fetch.max.bytes", ConsumerConfig.FetchSize)
+  val replicaFetchMaxBytes = props.getIntInRange("replica.fetch.max.bytes", ConsumerConfig.FetchSize, (messageMaxBytes, Int.MaxValue))
 
-  /* max wait time for each fetcher request issued by follower replicas*/
+  /* max wait time for each fetcher request issued by follower replicas. This value should always be less than the
+  *  replica.lag.time.max.ms at all times to prevent frequent shrinking of ISR for low throughput topics */
   val replicaFetchWaitMaxMs = props.getInt("replica.fetch.wait.max.ms", 500)
+  require(replicaFetchWaitMaxMs <= replicaLagTimeMaxMs, "replica.fetch.wait.max.ms should always be at least replica.lag.time.max.ms" +
+                                                        " to prevent frequent changes in ISR")
 
   /* minimum bytes expected for each fetch response. If not enough bytes, wait up to replicaMaxWaitTimeMs */
   val replicaFetchMinBytes = props.getInt("replica.fetch.min.bytes", 1)
@@ -169,6 +220,18 @@ class KafkaConfig private (val props: VerifiableProperties) extends ZKConfig(pro
   /* the purge interval (in number of requests) of the producer request purgatory */
   val producerPurgatoryPurgeIntervalRequests = props.getInt("producer.purgatory.purge.interval.requests", 10000)
 
+  /* Enables auto leader balancing. A background thread checks and triggers leader
+   * balance if required at regular intervals */
+  val autoLeaderRebalanceEnable = props.getBoolean("auto.leader.rebalance.enable", false)
+
+  /* the ratio of leader imbalance allowed per broker. The controller would trigger a leader balance if it goes above
+   * this value per broker. The value is specified in percentage. */
+  val leaderImbalancePerBrokerPercentage = props.getInt("leader.imbalance.per.broker.percentage", 10)
+
+  /* the frequency with which the partition rebalance check is triggered by the controller */
+  val leaderImbalanceCheckIntervalSeconds = props.getInt("leader.imbalance.check.interval.seconds", 300)
+
+
   /*********** Controlled shutdown configuration ***********/
 
   /** Controlled shutdown can fail for multiple reasons. This determines the number of retries when such failure happens */
@@ -181,4 +244,8 @@ class KafkaConfig private (val props: VerifiableProperties) extends ZKConfig(pro
   /* enable controlled shutdown of the server */
   val controlledShutdownEnable = props.getBoolean("controlled.shutdown.enable", false)
 
+  /*********** Misc configuration ***********/
+  
+  /* the maximum size for a metadata entry associated with an offset commit */
+  val offsetMetadataMaxSize = props.getInt("offset.metadata.max.bytes", 1024)
 }

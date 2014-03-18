@@ -77,7 +77,7 @@ object ByteBufferMessageSet {
     new ByteBufferMessageSet(outputBuffer)
   }
     
-  private def writeMessage(buffer: ByteBuffer, message: Message, offset: Long) {
+  private[kafka] def writeMessage(buffer: ByteBuffer, message: Message, offset: Long) {
     buffer.putLong(offset)
     buffer.putInt(message.size)
     buffer.put(message.buffer)

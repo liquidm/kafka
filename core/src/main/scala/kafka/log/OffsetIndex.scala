@@ -52,11 +52,11 @@ import kafka.common.InvalidOffsetException
  * All external APIs translate from relative offsets to full offsets, so users of this class do not interact with the internal 
  * storage format.
  */
-class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = -1) extends Logging {
+class OffsetIndex(@volatile var file: File, val baseOffset: Long, val maxIndexSize: Int = -1) extends Logging {
   
   private val lock = new ReentrantLock
   
-  /* the memory mapping */
+  /* initialize the memory mapping for this index */
   private var mmap: MappedByteBuffer = 
     {
       val newlyCreated = file.createNewFile()
@@ -69,12 +69,8 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
           raf.setLength(roundToExactMultiple(maxIndexSize, 8))
         }
           
-        val len = raf.length()  
-        if(len < 0 || len % 8 != 0)
-          throw new IllegalStateException("Index file " + file.getName + " is corrupt, found " + len + 
-                                          " bytes which is not positive or not a multiple of 8.")
-          
         /* memory-map the file */
+        val len = raf.length()
         val idx = raf.getChannel.map(FileChannel.MapMode.READ_WRITE, 0, len)
           
         /* set the position in the index for the next entry */
@@ -88,8 +84,8 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
         Utils.swallow(raf.close())
       }
     }
-
-  /* the number of entries in the index */
+  
+  /* the number of eight-byte entries currently in the index */
   private var size = new AtomicInteger(mmap.position / 8)
   
   /**
@@ -99,28 +95,30 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
   var maxEntries = mmap.limit / 8
   
   /* the last offset in the index */
-  var lastOffset = readLastOffset()
+  var lastOffset = readLastEntry.offset
   
   debug("Loaded index file %s with maxEntries = %d, maxIndexSize = %d, entries = %d, lastOffset = %d, file position = %d"
     .format(file.getAbsolutePath, maxEntries, maxIndexSize, entries(), lastOffset, mmap.position))
 
   /**
-   * The last offset written to the index
+   * The last entry in the index
    */
-  private def readLastOffset(): Long = {
+  def readLastEntry(): OffsetPosition = {
     inLock(lock) {
-      val offset = 
-        size.get match {
-          case 0 => 0
-          case s => relativeOffset(this.mmap, s-1)
-        }
-      baseOffset + offset
+      size.get match {
+        case 0 => OffsetPosition(baseOffset, 0)
+        case s => OffsetPosition(baseOffset + relativeOffset(this.mmap, s-1), physical(this.mmap, s-1))
+      }
     }
   }
 
   /**
    * Find the largest offset less than or equal to the given targetOffset 
    * and return a pair holding this offset and it's corresponding physical file position.
+   * 
+   * @param targetOffset The offset to look up.
+   * 
+   * @return The offset found and the corresponding file position for this offset. 
    * If the target offset is smaller than the least entry in the index (or the index is empty),
    * the pair (baseOffset, 0) is returned.
    */
@@ -138,7 +136,11 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
   /**
    * Find the slot in which the largest offset less than or equal to the given
    * target offset is stored.
-   * Return -1 if the least entry in the index is larger than the target offset or the index is empty
+   * 
+   * @param idx The index buffer
+   * @param targetOffset The offset to look for
+   * 
+   * @return The slot found or -1 if the least entry in the index is larger than the target offset or the index is empty
    */
   private def indexSlotFor(idx: ByteBuffer, targetOffset: Long): Int = {
     // we only store the difference from the base offset so calculate that
@@ -171,11 +173,13 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
   /* return the nth offset relative to the base offset */
   private def relativeOffset(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * 8)
   
-  /* return the nth physical offset */
+  /* return the nth physical position */
   private def physical(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * 8 + 4)
   
   /**
    * Get the nth offset mapping from the index
+   * @param n The entry number in the index
+   * @return The offset/position pair at that entry
    */
   def entry(n: Int): OffsetPosition = {
     maybeLock(lock) {
@@ -187,7 +191,7 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
   }
   
   /**
-   * Append entry for the given offset/location pair to the index. This entry must have a larger offset than all subsequent entries.
+   * Append an entry for the given offset/location pair to the index. This entry must have a larger offset than all subsequent entries.
    */
   def append(offset: Long, position: Int) {
     inLock(lock) {
@@ -201,7 +205,7 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
         require(entries * 8 == mmap.position, entries + " entries but file position in index is " + mmap.position + ".")
       } else {
         throw new InvalidOffsetException("Attempt to append an offset (%d) to position %d no larger than the last offset appended (%d) to %s."
-          .format(offset, entries, lastOffset, file.getName))
+          .format(offset, entries, lastOffset, file.getAbsolutePath))
       }
     }
   }
@@ -212,7 +216,7 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
   def isFull: Boolean = entries >= this.maxEntries
   
   /**
-   * Truncate the entire index
+   * Truncate the entire index, deleting all entries
    */
   def truncate() = truncateToEntries(0)
   
@@ -248,7 +252,7 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
     inLock(lock) {
       this.size.set(entries)
       mmap.position(this.size.get * 8)
-      this.lastOffset = readLastOffset
+      this.lastOffset = readLastEntry.offset
     }
   }
   
@@ -320,9 +324,38 @@ class OffsetIndex(val file: File, val baseOffset: Long, val maxIndexSize: Int = 
   /** The number of entries in this index */
   def entries() = size.get
   
+  /**
+   * The number of bytes actually used by this index
+   */
+  def sizeInBytes() = 8 * entries
+  
   /** Close the index */
   def close() {
     trimToValidSize()
+  }
+  
+  /**
+   * Rename the file that backs this offset index
+   * @return true iff the rename was successful
+   */
+  def renameTo(f: File): Boolean = {
+    val success = this.file.renameTo(f)
+    this.file = f
+    success
+  }
+  
+  /**
+   * Do a basic sanity check on this index to detect obvious problems
+   * @throw IllegalArgumentException if any problems are found
+   */
+  def sanityCheck() {
+    require(entries == 0 || lastOffset > baseOffset,
+            "Corrupt index found, index file (%s) has non-zero size but the last offset is %d and the base offset is %d"
+            .format(file.getAbsolutePath, lastOffset, baseOffset))
+      val len = file.length()
+      require(len % 8 == 0, 
+              "Index file " + file.getName + " is corrupt, found " + len + 
+              " bytes which is not positive or not a multiple of 8.")
   }
   
   /**

@@ -41,6 +41,8 @@ object ErrorMapping {
   val ReplicaNotAvailableCode: Short = 9
   val MessageSizeTooLargeCode: Short = 10
   val StaleControllerEpochCode: Short = 11
+  val OffsetMetadataTooLargeCode: Short = 12
+  val StaleLeaderEpochCode: Short = 13
 
   private val exceptionToCode = 
     Map[Class[Throwable], Short](
@@ -54,7 +56,8 @@ object ErrorMapping {
       classOf[BrokerNotAvailableException].asInstanceOf[Class[Throwable]] -> BrokerNotAvailableCode,
       classOf[ReplicaNotAvailableException].asInstanceOf[Class[Throwable]] -> ReplicaNotAvailableCode,
       classOf[MessageSizeTooLargeException].asInstanceOf[Class[Throwable]] -> MessageSizeTooLargeCode,
-      classOf[ControllerMovedException].asInstanceOf[Class[Throwable]] -> StaleControllerEpochCode
+      classOf[ControllerMovedException].asInstanceOf[Class[Throwable]] -> StaleControllerEpochCode,
+      classOf[OffsetMetadataTooLargeException].asInstanceOf[Class[Throwable]] -> OffsetMetadataTooLargeCode
     ).withDefaultValue(UnknownCode)
   
   /* invert the mapping */

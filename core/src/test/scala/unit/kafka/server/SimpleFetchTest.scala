@@ -19,28 +19,27 @@ package kafka.server
 import kafka.cluster.{Partition, Replica}
 import kafka.log.Log
 import kafka.message.{ByteBufferMessageSet, Message}
-import kafka.network.{BoundedByteBufferSend, RequestChannel}
+import kafka.network.RequestChannel
 import kafka.utils.{ZkUtils, Time, TestUtils, MockTime}
 import org.easymock.EasyMock
 import org.I0Itec.zkclient.ZkClient
 import org.scalatest.junit.JUnit3Suite
 import kafka.api._
 import scala.Some
-import org.junit.Assert._
 import kafka.common.TopicAndPartition
-
 
 class SimpleFetchTest extends JUnit3Suite {
 
   val configs = TestUtils.createBrokerConfigs(2).map(new KafkaConfig(_) {
     override val replicaLagTimeMaxMs = 100L
+    override val replicaFetchWaitMaxMs = 100
     override val replicaLagMaxMessages = 10L
   })
   val topic = "foo"
   val partitionId = 0
 
   /**
-   * The scenario for this test is that there is one topic, "test-topic", on broker "0" that has
+   * The scenario for this test is that there is one topic, "test-topic", one broker "0" that has
    * one  partition with one follower replica on broker "1".  The leader replica on "0"
    * has HW of "5" and LEO of "20".  The follower on broker "1" has a local replica
    * with a HW matching the leader's ("5") and LEO of "15", meaning it's not in-sync
@@ -64,12 +63,12 @@ class SimpleFetchTest extends JUnit3Suite {
 
     val log = EasyMock.createMock(classOf[kafka.log.Log])
     EasyMock.expect(log.logEndOffset).andReturn(leo).anyTimes()
+    EasyMock.expect(log)
     EasyMock.expect(log.read(0, fetchSize, Some(hw))).andReturn(new ByteBufferMessageSet(messages))
     EasyMock.replay(log)
 
     val logManager = EasyMock.createMock(classOf[kafka.log.LogManager])
-    EasyMock.expect(logManager.getLog(topic, partitionId)).andReturn(Some(log)).anyTimes()
-    EasyMock.expect(logManager.config).andReturn(configs.head).anyTimes()
+    EasyMock.expect(logManager.getLog(TopicAndPartition(topic, partitionId))).andReturn(Some(log)).anyTimes()
     EasyMock.replay(logManager)
 
     val replicaManager = EasyMock.createMock(classOf[kafka.server.ReplicaManager])
@@ -92,8 +91,10 @@ class SimpleFetchTest extends JUnit3Suite {
     // start a request channel with 2 processors and a queue size of 5 (this is more or less arbitrary)
     // don't provide replica or leader callbacks since they will not be tested here
     val requestChannel = new RequestChannel(2, 5)
-    val apis = new KafkaApis(requestChannel, replicaManager, zkClient, configs.head.brokerId, controller)
-
+    val apis = new KafkaApis(requestChannel, replicaManager, zkClient, configs.head.brokerId, configs.head, controller)
+    val partitionStateInfo = EasyMock.createNiceMock(classOf[PartitionStateInfo])
+    apis.metadataCache.put(TopicAndPartition(topic, partitionId), partitionStateInfo)
+    EasyMock.replay(partitionStateInfo)
     // This request (from a follower) wants to read up to 2*HW but should only get back up to HW bytes into the log
     val goodFetch = new FetchRequestBuilder()
           .replicaId(Request.OrdinaryConsumerId)
@@ -106,33 +107,6 @@ class SimpleFetchTest extends JUnit3Suite {
 
     // make sure the log only reads bytes between 0->HW (5)
     EasyMock.verify(log)
-
-    // Test offset request from non-replica
-    val topicAndPartition = TopicAndPartition(topic, partition.partitionId)
-    val offsetRequest = OffsetRequest(
-      Map(topicAndPartition -> PartitionOffsetRequestInfo(OffsetRequest.LatestTime, 1)))
-    val offsetRequestBB = TestUtils.createRequestByteBuffer(offsetRequest)
-
-    EasyMock.reset(logManager)
-    EasyMock.reset(replicaManager)
-
-    EasyMock.expect(replicaManager.getLeaderReplicaIfLocal(topic, partitionId)).andReturn(partition.leaderReplicaIfLocal().get)
-    EasyMock.expect(replicaManager.logManager).andReturn(logManager)
-    EasyMock.expect(logManager.getOffsets(topicAndPartition, OffsetRequest.LatestTime, 1)).andReturn(Seq(leo))
-
-    EasyMock.replay(replicaManager)
-    EasyMock.replay(logManager)
-
-    apis.handleOffsetRequest(new RequestChannel.Request(processor = 0,
-                                                        requestKey = 5,
-                                                        buffer = offsetRequestBB,
-                                                        startTimeMs = 1))
-    val offsetResponseBuffer = requestChannel.receiveResponse(0).responseSend.asInstanceOf[BoundedByteBufferSend].buffer
-    val offsetResponse = OffsetResponse.readFrom(offsetResponseBuffer)
-    EasyMock.verify(replicaManager)
-    EasyMock.verify(logManager)
-    assertEquals(1, offsetResponse.partitionErrorAndOffsets(topicAndPartition).offsets.size)
-    assertEquals(hw.toLong, offsetResponse.partitionErrorAndOffsets(topicAndPartition).offsets.head)
   }
 
   /**
@@ -165,8 +139,7 @@ class SimpleFetchTest extends JUnit3Suite {
     EasyMock.replay(log)
 
     val logManager = EasyMock.createMock(classOf[kafka.log.LogManager])
-    EasyMock.expect(logManager.getLog(topic, 0)).andReturn(Some(log)).anyTimes()
-    EasyMock.expect(logManager.config).andReturn(configs.head).anyTimes()
+    EasyMock.expect(logManager.getLog(TopicAndPartition(topic, 0))).andReturn(Some(log)).anyTimes()
     EasyMock.replay(logManager)
 
     val replicaManager = EasyMock.createMock(classOf[kafka.server.ReplicaManager])
@@ -189,7 +162,10 @@ class SimpleFetchTest extends JUnit3Suite {
     val controller = EasyMock.createMock(classOf[kafka.controller.KafkaController])
 
     val requestChannel = new RequestChannel(2, 5)
-    val apis = new KafkaApis(requestChannel, replicaManager, zkClient, configs.head.brokerId, controller)
+    val apis = new KafkaApis(requestChannel, replicaManager, zkClient, configs.head.brokerId, configs.head, controller)
+    val partitionStateInfo = EasyMock.createNiceMock(classOf[PartitionStateInfo])
+    apis.metadataCache.put(TopicAndPartition(topic, partitionId), partitionStateInfo)
+    EasyMock.replay(partitionStateInfo)
 
     /**
      * This fetch, coming from a replica, requests all data at offset "15".  Because the request is coming
@@ -210,34 +186,6 @@ class SimpleFetchTest extends JUnit3Suite {
      * an offset of 15
      */
     EasyMock.verify(log)
-
-    // Test offset request from replica
-    val topicAndPartition = TopicAndPartition(topic, partition.partitionId)
-    val offsetRequest = OffsetRequest(
-      Map(topicAndPartition -> PartitionOffsetRequestInfo(OffsetRequest.LatestTime, 1)),
-      replicaId = followerReplicaId)
-    val offsetRequestBB = TestUtils.createRequestByteBuffer(offsetRequest)
-
-    EasyMock.reset(logManager)
-    EasyMock.reset(replicaManager)
-
-    EasyMock.expect(replicaManager.getLeaderReplicaIfLocal(topic, partitionId)).andReturn(partition.leaderReplicaIfLocal().get)
-    EasyMock.expect(replicaManager.logManager).andReturn(logManager)
-    EasyMock.expect(logManager.getOffsets(topicAndPartition, OffsetRequest.LatestTime, 1)).andReturn(Seq(leo))
-
-    EasyMock.replay(replicaManager)
-    EasyMock.replay(logManager)
-
-    apis.handleOffsetRequest(new RequestChannel.Request(processor = 1,
-                                                        requestKey = 5,
-                                                        buffer = offsetRequestBB,
-                                                        startTimeMs = 1))
-    val offsetResponseBuffer = requestChannel.receiveResponse(1).responseSend.asInstanceOf[BoundedByteBufferSend].buffer
-    val offsetResponse = OffsetResponse.readFrom(offsetResponseBuffer)
-    EasyMock.verify(replicaManager)
-    EasyMock.verify(logManager)
-    assertEquals(1, offsetResponse.partitionErrorAndOffsets(topicAndPartition).offsets.size)
-    assertEquals(leo.toLong, offsetResponse.partitionErrorAndOffsets(topicAndPartition).offsets.head)
   }
 
   private def getPartitionWithAllReplicasInISR(topic: String, partitionId: Int, time: Time, leaderId: Int,

@@ -23,13 +23,13 @@ import charset.Charset
 import java.nio.channels._
 import java.util.concurrent.locks.Lock
 import java.lang.management._
-import java.util.zip.CRC32
 import javax.management._
 import scala.collection._
 import mutable.ListBuffer
 import scala.collection.mutable
 import java.util.Properties
 import kafka.common.KafkaException
+import kafka.common.KafkaStorageException
 
 
 /**
@@ -53,26 +53,6 @@ object Utils extends Logging {
   def runnable(fun: () => Unit): Runnable = 
     new Runnable() {
       def run() = fun()
-    }
-  
-  /**
-   * Wrap the given function in a java.lang.Runnable that logs any errors encountered
-   * @param fun A function
-   * @return A Runnable that just executes the function
-   */
-  def loggedRunnable(fun: () => Unit, name: String): Runnable =
-    new Runnable() {
-      def run() = {
-        Thread.currentThread().setName(name)
-        try {
-          fun()
-        }
-        catch {
-          case t: Throwable =>
-            // log any error and the stack trace
-            error("error in loggedRunnable", t)
-        }
-      }
     }
 
   /**
@@ -182,7 +162,7 @@ object Utils extends Logging {
    * @param log The log method to use for logging. E.g. logger.warn
    * @param action The action to execute
    */
-  def swallow(log: (Object, Throwable) => Unit, action: => Unit) = {
+  def swallow(log: (Object, Throwable) => Unit, action: => Unit) {
     try {
       action
     } catch {
@@ -244,18 +224,18 @@ object Utils extends Logging {
    * @param file The root file at which to begin deleting
    */
   def rm(file: File) {
-	if(file == null) {
-	  return
-	} else if(file.isDirectory) {
-	  val files = file.listFiles()
-	  if(files != null) {
-	    for(f <- files)
-	      rm(f)
+	  if(file == null) {
+	    return
+	  } else if(file.isDirectory) {
+	    val files = file.listFiles()
+	    if(files != null) {
+	      for(f <- files)
+	        rm(f)
+	    }
+	    file.delete()
+	  } else {
+	    file.delete()
 	  }
-	  file.delete()
-	} else {
-	  file.delete()
-	}
   }
   
   /**
@@ -350,7 +330,7 @@ object Utils extends Logging {
    * @return The CRC32
    */
   def crc32(bytes: Array[Byte], offset: Int, size: Int): Long = {
-    val crc = new CRC32()
+    val crc = new Crc32()
     crc.update(bytes, offset, size)
     crc.getValue()
   }
@@ -466,65 +446,6 @@ object Utils extends Logging {
   def nullOrEmpty(s: String): Boolean = s == null || s.equals("")
 
   /**
-   * Merge JSON fields of the format "key" : value/object/array.
-   */
-  def mergeJsonFields(objects: Seq[String]): String = {
-    val builder = new StringBuilder
-    builder.append("{ ")
-    builder.append(objects.sorted.map(_.trim).mkString(", "))
-    builder.append(" }")
-    builder.toString
-  }
-
- /**
-   * Format a Map[String, String] as JSON object.
-   */
-  def mapToJsonFields(jsonDataMap: Map[String, String], valueInQuotes: Boolean): Seq[String] = {
-    val jsonFields: mutable.ListBuffer[String] = ListBuffer()
-    val builder = new StringBuilder
-    for ((key, value) <- jsonDataMap.toList.sorted) {
-      builder.append("\"" + key + "\":")
-      if (valueInQuotes)
-        builder.append("\"" + value + "\"")
-      else
-        builder.append(value)
-      jsonFields += builder.toString
-      builder.clear()
-    }
-    jsonFields
-  }
-
-  /**
-   * Format a Map[String, String] as JSON object.
-   */
-  def mapToJson(jsonDataMap: Map[String, String], valueInQuotes: Boolean): String = {
-    mergeJsonFields(mapToJsonFields(jsonDataMap, valueInQuotes))
-  }
-
-   /**
-   * Format a Seq[String] as JSON array.
-   */
-  def seqToJson(jsonData: Seq[String], valueInQuotes: Boolean): String = {
-    val builder = new StringBuilder
-    builder.append("[ ")
-    if (valueInQuotes)
-      builder.append(jsonData.map("\"" + _ + "\"").mkString(", "))
-    else
-      builder.append(jsonData.mkString(", "))
-    builder.append(" ]")
-    builder.toString
-  }
-
-  /**
-   * Format a Map[String, Seq[Int]] as JSON
-   */
-
-  def mapWithSeqValuesToJson(jsonDataMap: Map[String, Seq[Int]]): String = {
-    mergeJsonFields(mapToJsonFields(jsonDataMap.map(e => (e._1 -> seqToJson(e._2.map(_.toString), valueInQuotes = false))),
-                                    valueInQuotes = false))
-  }
-
-  /**
    * Create a circular (looping) iterator over a collection.
    * @param coll An iterable over the underlying collection.
    * @return A circular iterator over the collection.
@@ -555,6 +476,58 @@ object Utils extends Logging {
    * This is different from java.lang.Math.abs or scala.math.abs in that they return Int.MinValue (!).
    */
   def abs(n: Int) = n & 0x7fffffff
+
+  /**
+   * Replace the given string suffix with the new suffix. If the string doesn't end with the given suffix throw an exception.
+   */
+  def replaceSuffix(s: String, oldSuffix: String, newSuffix: String): String = {
+    if(!s.endsWith(oldSuffix))
+      throw new IllegalArgumentException("Expected string to end with '%s' but string is '%s'".format(oldSuffix, s))
+    s.substring(0, s.length - oldSuffix.length) + newSuffix
+  }
+
+  /**
+   * Create a file with the given path
+   * @param path The path to create
+   * @throw KafkaStorageException If the file create fails
+   * @return The created file
+   */
+  def createFile(path: String): File = {
+    val f = new File(path)
+    val created = f.createNewFile()
+    if(!created)
+      throw new KafkaStorageException("Failed to create file %s.".format(path))
+    f
+  }
+  
+  /**
+   * Turn a properties map into a string
+   */
+  def asString(props: Properties): String = {
+    val writer = new StringWriter()
+    props.store(writer, "")
+    writer.toString
+  }
+  
+  /**
+   * Read some properties with the given default values
+   */
+  def readProps(s: String, defaults: Properties): Properties = {
+    val reader = new StringReader(s)
+    val props = new Properties(defaults)
+    props.load(reader)
+    props
+  }
+  
+  /**
+   * Read a big-endian integer from a byte array
+   */
+  def readInt(bytes: Array[Byte], offset: Int): Int = {
+    ((bytes(offset) & 0xFF) << 24) |
+    ((bytes(offset + 1) & 0xFF) << 16) |
+    ((bytes(offset + 2) & 0xFF) << 8) |
+    (bytes(offset + 3) & 0xFF)
+  }
   
   /**
    * Execute the given function inside the lock
@@ -562,9 +535,10 @@ object Utils extends Logging {
   def inLock[T](lock: Lock)(fun: => T): T = {
     lock.lock()
     try {
-      return fun
+       return fun
     } finally {
       lock.unlock()
     }
   }
+  
 }

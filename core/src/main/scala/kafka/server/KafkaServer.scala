@@ -17,15 +17,20 @@
 
 package kafka.server
 
-import kafka.network.{Receive, BlockingChannel, SocketServer}
+import kafka.admin._
+import kafka.log.LogConfig
+import kafka.log.CleanerConfig
 import kafka.log.LogManager
 import kafka.utils._
 import java.util.concurrent._
 import atomic.{AtomicInteger, AtomicBoolean}
+import java.io.File
+import org.I0Itec.zkclient.ZkClient
 import kafka.controller.{ControllerStats, KafkaController}
 import kafka.cluster.Broker
 import kafka.api.{ControlledShutdownResponse, ControlledShutdownRequest}
 import kafka.common.ErrorMapping
+import kafka.network.{Receive, BlockingChannel, SocketServer}
 
 /**
  * Represents the lifecycle of a single Kafka broker. Handles all functionality required
@@ -40,29 +45,31 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
   var socketServer: SocketServer = null
   var requestHandlerPool: KafkaRequestHandlerPool = null
   var logManager: LogManager = null
-  var kafkaZookeeper: KafkaZooKeeper = null
+  var kafkaHealthcheck: KafkaHealthcheck = null
+  var topicConfigManager: TopicConfigManager = null
   var replicaManager: ReplicaManager = null
   var apis: KafkaApis = null
   var kafkaController: KafkaController = null
-  val kafkaScheduler = new KafkaScheduler(4)
-
+  val kafkaScheduler = new KafkaScheduler(config.backgroundThreads)
+  var zkClient: ZkClient = null
 
   /**
    * Start up API for bringing up a single instance of the Kafka server.
    * Instantiates the LogManager, the SocketServer and the request handlers - KafkaRequestHandlers
    */
   def startup() {
-    info("Starting")
+    info("starting")
     isShuttingDown = new AtomicBoolean(false)
     shutdownLatch = new CountDownLatch(1)
 
     /* start scheduler */
-    kafkaScheduler.startup
+    kafkaScheduler.startup()
+    
+    /* setup zookeeper */
+    zkClient = initZk()
 
     /* start log manager */
-    logManager = new LogManager(config,
-                                kafkaScheduler,
-                                time)
+    logManager = createLogManager(zkClient)
     logManager.startup()
 
     socketServer = new SocketServer(config.brokerId,
@@ -73,31 +80,39 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
                                     config.socketSendBufferBytes,
                                     config.socketReceiveBufferBytes,
                                     config.socketRequestMaxBytes)
+    socketServer.startup()
 
-    socketServer.startup
-
-    /* start client */
-    kafkaZookeeper = new KafkaZooKeeper(config)
-    // starting relevant replicas and leader election for partitions assigned to this broker
-    kafkaZookeeper.startup
-
-    info("Connecting to ZK: " + config.zkConnect)
-
-    replicaManager = new ReplicaManager(config, time, kafkaZookeeper.getZookeeperClient, kafkaScheduler, logManager, isShuttingDown)
-
-    kafkaController = new KafkaController(config, kafkaZookeeper.getZookeeperClient)
-    apis = new KafkaApis(socketServer.requestChannel, replicaManager, kafkaZookeeper.getZookeeperClient, config.brokerId, kafkaController)
+    replicaManager = new ReplicaManager(config, time, zkClient, kafkaScheduler, logManager, isShuttingDown)
+    kafkaController = new KafkaController(config, zkClient)
+    
+    /* start processing requests */
+    apis = new KafkaApis(socketServer.requestChannel, replicaManager, zkClient, config.brokerId, config, kafkaController)
     requestHandlerPool = new KafkaRequestHandlerPool(config.brokerId, socketServer.requestChannel, apis, config.numIoThreads)
-    Mx4jLoader.maybeLoad
+   
+    Mx4jLoader.maybeLoad()
 
-    // start the replica manager
     replicaManager.startup()
-    // start the controller
+
     kafkaController.startup()
-    // register metrics beans
+    
+    topicConfigManager = new TopicConfigManager(zkClient, logManager)
+    topicConfigManager.startup()
+    
+    /* tell everyone we are alive */
+    kafkaHealthcheck = new KafkaHealthcheck(config.brokerId, config.advertisedHostName, config.advertisedPort, config.zkSessionTimeoutMs, zkClient)
+    kafkaHealthcheck.startup()
+
+    
     registerStats()
     startupComplete.set(true);
-    info("Started")
+    info("started")
+  }
+  
+  private def initZk(): ZkClient = {
+    info("Connecting to zookeeper on " + config.zkConnect)
+    val zkClient = new ZkClient(config.zkConnect, config.zkSessionTimeoutMs, config.zkConnectionTimeoutMs, ZKStringSerializer)
+    ZkUtils.setupCommonPaths(zkClient)
+    zkClient
   }
 
   /**
@@ -130,8 +145,8 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
 
           // Get the current controller info. This is to ensure we use the most recent info to issue the
           // controlled shutdown request
-          val controllerId = ZkUtils.getController(kafkaZookeeper.getZookeeperClient)
-          ZkUtils.getBrokerInfo(kafkaZookeeper.getZookeeperClient, controllerId) match {
+          val controllerId = ZkUtils.getController(zkClient)
+          ZkUtils.getBrokerInfo(zkClient, controllerId) match {
             case Some(broker) =>
               if (channel == null || prevController == null || !prevController.equals(broker)) {
                 // if this is the first attempt or if the controller has changed, create a channel to the most recent
@@ -199,12 +214,10 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
    * Shuts down the LogManager, the SocketServer and the log cleaner scheduler thread
    */
   def shutdown() {
-    info("Shutting down")
+    info("shutting down")
     val canShutdown = isShuttingDown.compareAndSet(false, true);
     if (canShutdown) {
       Utils.swallow(controlledShutdown())
-      if(kafkaZookeeper != null)
-        Utils.swallow(kafkaZookeeper.shutdown())
       if(socketServer != null)
         Utils.swallow(socketServer.shutdown())
       if(requestHandlerPool != null)
@@ -216,13 +229,14 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
         Utils.swallow(replicaManager.shutdown())
       if(logManager != null)
         Utils.swallow(logManager.shutdown())
-
       if(kafkaController != null)
         Utils.swallow(kafkaController.shutdown())
+      if(zkClient != null)
+        Utils.swallow(zkClient.close())
 
       shutdownLatch.countDown()
       startupComplete.set(false);
-      info("Shut down completed")
+      info("shut down completed")
     }
   }
 
@@ -232,6 +246,43 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
   def awaitShutdown(): Unit = shutdownLatch.await()
 
   def getLogManager(): LogManager = logManager
+  
+  private def createLogManager(zkClient: ZkClient): LogManager = {
+    val defaultLogConfig = LogConfig(segmentSize = config.logSegmentBytes, 
+                                     segmentMs = 60L * 60L * 1000L * config.logRollHours,
+                                     flushInterval = config.logFlushIntervalMessages,
+                                     flushMs = config.logFlushIntervalMs.toLong,
+                                     retentionSize = config.logRetentionBytes,
+                                     retentionMs = config.logRetentionTimeMillis,
+                                     maxMessageSize = config.messageMaxBytes,
+                                     maxIndexSize = config.logIndexSizeMaxBytes,
+                                     indexInterval = config.logIndexIntervalBytes,
+                                     deleteRetentionMs = config.logCleanerDeleteRetentionMs,
+                                     fileDeleteDelayMs = config.logDeleteDelayMs,
+                                     minCleanableRatio = config.logCleanerMinCleanRatio,
+                                     compact = config.logCleanupPolicy.trim.toLowerCase == "compact")
+    val defaultProps = defaultLogConfig.toProps
+    val configs = AdminUtils.fetchAllTopicConfigs(zkClient).mapValues(LogConfig.fromProps(defaultProps, _))
+    // read the log configurations from zookeeper
+    val cleanerConfig = CleanerConfig(numThreads = config.logCleanerThreads,
+                                      dedupeBufferSize = config.logCleanerDedupeBufferSize,
+                                      dedupeBufferLoadFactor = config.logCleanerDedupeBufferLoadFactor,
+                                      ioBufferSize = config.logCleanerIoBufferSize,
+                                      maxMessageSize = config.messageMaxBytes,
+                                      maxIoBytesPerSecond = config.logCleanerIoMaxBytesPerSecond,
+                                      backOffMs = config.logCleanerBackoffMs,
+                                      enableCleaner = config.logCleanerEnable)
+    new LogManager(logDirs = config.logDirs.map(new File(_)).toArray,
+                   topicConfigs = configs,
+                   defaultConfig = defaultLogConfig,
+                   cleanerConfig = cleanerConfig,
+                   flushCheckMs = config.logFlushSchedulerIntervalMs,
+                   flushCheckpointMs = config.logFlushOffsetCheckpointIntervalMs,
+                   retentionCheckMs = config.logCleanupIntervalMs,
+                   scheduler = kafkaScheduler,
+                   time = time)
+  }
+
 }
 
 
