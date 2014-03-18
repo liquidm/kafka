@@ -214,7 +214,7 @@ object SimpleConsumerShell extends Logging {
                   System.out.println("next offset = " + offset)
                 val message = messageAndOffset.message
                 val key = if(message.hasKey) Utils.readBytes(message.key) else null
-                formatter.writeTo(key, Utils.readBytes(message.payload), System.out)
+                formatter.writeTo(key, if(message.isNull) null else Utils.readBytes(message.payload), System.out)
                 numMessagesConsumed += 1
               } catch {
                 case e: Throwable =>

@@ -19,7 +19,6 @@ package kafka.server
 
 import org.scalatest.junit.JUnit3Suite
 import kafka.zk.ZooKeeperTestHarness
-import kafka.admin.CreateTopicCommand
 import kafka.utils.TestUtils._
 import junit.framework.Assert._
 import kafka.utils.{ZkUtils, Utils, TestUtils}
@@ -27,6 +26,7 @@ import kafka.controller.{ControllerContext, LeaderIsrAndControllerEpoch, Control
 import kafka.cluster.Broker
 import kafka.common.ErrorMapping
 import kafka.api._
+import kafka.admin.AdminUtils
 
 class RollingBounceTest extends JUnit3Suite with ZooKeeperTestHarness {
   val brokerId1 = 0
@@ -79,11 +79,10 @@ class RollingBounceTest extends JUnit3Suite with ZooKeeperTestHarness {
     val topic4 = "new-topic4"
 
     // create topics with 1 partition, 2 replicas, one on each broker
-    CreateTopicCommand.createTopic(zkClient, topic1, 1, 2, "0:1")
-    CreateTopicCommand.createTopic(zkClient, topic2, 1, 2, "1:2")
-    CreateTopicCommand.createTopic(zkClient, topic3, 1, 2, "2:3")
-    CreateTopicCommand.createTopic(zkClient, topic4, 1, 2, "0:3")
-
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic1, Map(0->Seq(0,1)))
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic2, Map(0->Seq(1,2)))
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic3, Map(0->Seq(2,3)))
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic4, Map(0->Seq(0,3)))
 
     // wait until leader is elected
     var leader1 = waitUntilLeaderIsElectedOrChanged(zkClient, topic1, partitionId, 500)

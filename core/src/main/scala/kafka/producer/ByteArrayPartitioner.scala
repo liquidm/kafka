@@ -20,8 +20,8 @@ package kafka.producer
 
 import kafka.utils._
 
-private class ByteArrayPartitioner(props: VerifiableProperties = null) extends Partitioner[Array[Byte]] {
-  def partition(key: Array[Byte], numPartitions: Int): Int = {
-    Utils.abs(java.util.Arrays.hashCode(key)) % numPartitions
+private class ByteArrayPartitioner(props: VerifiableProperties = null) extends Partitioner {
+  def partition(key: Any, numPartitions: Int): Int = {
+    Utils.abs(java.util.Arrays.hashCode(key.asInstanceOf[Array[Byte]])) % numPartitions
   }
 }

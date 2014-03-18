@@ -64,10 +64,10 @@ class AddPartitionsTest extends JUnit3Suite with ZooKeeperTestHarness {
     brokers = servers.map(s => new Broker(s.config.brokerId, s.config.hostName, s.config.port))
 
     // create topics with 1 partition, 2 replicas, one on each broker
-    CreateTopicCommand.createTopic(zkClient, topic1, 1, 2, "0:1")
-    CreateTopicCommand.createTopic(zkClient, topic2, 1, 2, "1:2")
-    CreateTopicCommand.createTopic(zkClient, topic3, 1, 4, "2:3:0:1")
-    CreateTopicCommand.createTopic(zkClient, topic4, 1, 4, "0:3")
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic1, Map(0->Seq(0,1)))
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic2, Map(0->Seq(1,2)))
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic3, Map(0->Seq(2,3,0,1)))
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic4, Map(0->Seq(0,3)))
 
 
     // wait until leader is elected
@@ -100,26 +100,26 @@ class AddPartitionsTest extends JUnit3Suite with ZooKeeperTestHarness {
 
   def testTopicDoesNotExist {
     try {
-      AddPartitionsCommand.addPartitions(zkClient, "Blah", 1)
+      AdminUtils.addPartitions(zkClient, "Blah", 1)
       fail("Topic should not exist")
     } catch {
-      case e: AdministrationException => //this is good
+      case e: AdminOperationException => //this is good
       case e2: Throwable => throw e2
     }
   }
 
   def testWrongReplicaCount {
     try {
-      AddPartitionsCommand.addPartitions(zkClient, topic1, 2, "0:1:2")
+      AdminUtils.addPartitions(zkClient, topic1, 2, "0:1,0:1:2")
       fail("Add partitions should fail")
     } catch {
-      case e: AdministrationException => //this is good
+      case e: AdminOperationException => //this is good
       case e2: Throwable => throw e2
     }
   }
 
   def testIncrementPartitions {
-    AddPartitionsCommand.addPartitions(zkClient, topic1, 2)
+    AdminUtils.addPartitions(zkClient, topic1, 3)
     // wait until leader is elected
     var leader1 = waitUntilLeaderIsElectedOrChanged(zkClient, topic1, 1, 500)
     var leader2 = waitUntilLeaderIsElectedOrChanged(zkClient, topic1, 2, 500)
@@ -144,7 +144,7 @@ class AddPartitionsTest extends JUnit3Suite with ZooKeeperTestHarness {
   }
 
   def testManualAssignmentOfReplicas {
-    AddPartitionsCommand.addPartitions(zkClient, topic2, 2, "0:1,2:3")
+    AdminUtils.addPartitions(zkClient, topic2, 3, "1:2,0:1,2:3")
     // wait until leader is elected
     var leader1 = waitUntilLeaderIsElectedOrChanged(zkClient, topic2, 1, 500)
     var leader2 = waitUntilLeaderIsElectedOrChanged(zkClient, topic2, 2, 500)
@@ -170,7 +170,7 @@ class AddPartitionsTest extends JUnit3Suite with ZooKeeperTestHarness {
   }
 
   def testReplicaPlacement {
-    AddPartitionsCommand.addPartitions(zkClient, topic3, 6)
+    AdminUtils.addPartitions(zkClient, topic3, 7)
     // wait until leader is elected
     var leader1 = waitUntilLeaderIsElectedOrChanged(zkClient, topic3, 1, 500)
     var leader2 = waitUntilLeaderIsElectedOrChanged(zkClient, topic3, 2, 500)

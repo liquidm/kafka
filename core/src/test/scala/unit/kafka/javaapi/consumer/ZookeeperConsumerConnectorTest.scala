@@ -21,7 +21,7 @@ import junit.framework.Assert._
 import kafka.integration.KafkaServerTestHarness
 import kafka.server._
 import org.scalatest.junit.JUnit3Suite
-import scala.collection.JavaConversions._
+import scala.collection.JavaConversions
 import org.apache.log4j.{Level, Logger}
 import kafka.message._
 import kafka.serializer._
@@ -84,7 +84,7 @@ class ZookeeperConsumerConnectorTest extends JUnit3Suite with KafkaServerTestHar
     for (partition <- 0 until numParts) {
       val ms = 0.until(messagesPerNode).map(x => header + conf.brokerId + "-" + partition + "-" + x)
       messages ++= ms
-      import scala.collection.JavaConversions._
+      import JavaConversions._
       javaProducer.send(ms.map(new KeyedMessage[Int, String](topic, partition, _)): java.util.List[KeyedMessage[Int, String]])
     }
     javaProducer.close

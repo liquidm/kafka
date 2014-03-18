@@ -26,7 +26,7 @@ import kafka.zk.ZooKeeperTestHarness
 import kafka.producer._
 import kafka.utils.IntEncoder
 import kafka.utils.TestUtils._
-import kafka.admin.CreateTopicCommand
+import kafka.admin.AdminUtils
 import kafka.api.FetchRequestBuilder
 import kafka.utils.{TestUtils, Utils}
 
@@ -49,17 +49,18 @@ class ServerShutdownTest extends JUnit3Suite with ZooKeeperTestHarness {
     var producer = new Producer[Int, String](new ProducerConfig(producerConfig))
 
     // create topic
-    CreateTopicCommand.createTopic(zkClient, topic, 1, 1, "0")
+    AdminUtils.createTopic(zkClient, topic, 1, 1)
     TestUtils.waitUntilMetadataIsPropagated(Seq(server), topic, 0, 1000)
 
     // send some messages
     producer.send(sent1.map(m => new KeyedMessage[Int, String](topic, 0, m)):_*)
 
-    // do a clean shutdown and check that the clean shudown file is written out
+    // do a clean shutdown and check that offset checkpoint file exists
     server.shutdown()
     for(logDir <- config.logDirs) {
-      val cleanShutDownFile = new File(logDir, server.logManager.CleanShutdownFile)
-      assertTrue(cleanShutDownFile.exists)
+      val OffsetCheckpointFile = new File(logDir, server.logManager.RecoveryPointCheckpointFile)
+      assertTrue(OffsetCheckpointFile.exists)
+      assertTrue(OffsetCheckpointFile.length() > 0)
     }
     producer.close()
     

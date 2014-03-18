@@ -19,10 +19,15 @@ package kafka.admin
 import junit.framework.Assert._
 import org.junit.Test
 import org.scalatest.junit.JUnit3Suite
+import java.util.Properties
+import kafka.utils._
+import kafka.log._
 import kafka.zk.ZooKeeperTestHarness
-import kafka.server.KafkaConfig
 import kafka.utils.{Logging, ZkUtils, TestUtils}
-import kafka.common.{TopicExistsException, ErrorMapping, TopicAndPartition}
+import kafka.common.{TopicExistsException, TopicAndPartition}
+import kafka.server.{KafkaServer, KafkaConfig}
+import java.io.File
+import TestUtils._
 
 
 class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
@@ -32,28 +37,17 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     val brokerList = List(0, 1, 2, 3, 4)
 
     // test 0 replication factor
-    try {
+    intercept[AdminOperationException] {
       AdminUtils.assignReplicasToBrokers(brokerList, 10, 0)
-      fail("shouldn't allow replication factor 0")
-    }
-    catch {
-      case e: AdministrationException => // this is good
-      case e2: Throwable => throw e2
     }
 
     // test wrong replication factor
-    try {
+    intercept[AdminOperationException] {
       AdminUtils.assignReplicasToBrokers(brokerList, 10, 6)
-      fail("shouldn't allow replication factor larger than # of brokers")
-    }
-    catch {
-      case e: AdministrationException => // this is good
-      case e2: Throwable => throw e2
     }
 
     // correct assignment
-    {
-      val expectedAssignment = Map(
+    val expectedAssignment = Map(
         0 -> List(0, 1, 2),
         1 -> List(1, 2, 3),
         2 -> List(2, 3, 4),
@@ -63,65 +57,34 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
         6 -> List(1, 3, 4),
         7 -> List(2, 4, 0),
         8 -> List(3, 0, 1),
-        9 -> List(4, 1, 2)
-      )
+        9 -> List(4, 1, 2))
 
-      val actualAssignment = AdminUtils.assignReplicasToBrokers(brokerList, 10, 3, 0)
-      val e = (expectedAssignment.toList == actualAssignment.toList)
-      assertTrue(expectedAssignment.toList == actualAssignment.toList)
-    }
+    val actualAssignment = AdminUtils.assignReplicasToBrokers(brokerList, 10, 3, 0)
+    val e = (expectedAssignment.toList == actualAssignment.toList)
+    assertTrue(expectedAssignment.toList == actualAssignment.toList)
   }
 
   @Test
   def testManualReplicaAssignment() {
-    val brokerList = Set(0, 1, 2, 3, 4)
+    val brokers = List(0, 1, 2, 3, 4)
+    TestUtils.createBrokersInZk(zkClient, brokers)
 
-    // duplicated brokers
-    try {
-      val replicationAssignmentStr = "0,0,1:1,2,3"
-      CreateTopicCommand.getManualReplicaAssignment(replicationAssignmentStr, brokerList)
-      fail("replication assginment shouldn't have duplicated brokers")
-    }
-    catch {
-      case e: AdministrationException => // this is good
-      case e2: Throwable => throw e2
-    }
-
-    // non-exist brokers
-    try {
-      val replicationAssignmentStr = "0,1,2:1,2,7"
-      CreateTopicCommand.getManualReplicaAssignment(replicationAssignmentStr, brokerList)
-      fail("replication assginment shouldn't contain non-exist brokers")
-    }
-    catch {
-      case e: AdministrationException => // this is good
-      case e2: Throwable => throw e2
+    // duplicate brokers
+    intercept[IllegalArgumentException] {
+      AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, "test", Map(0->Seq(0,0)))
     }
 
     // inconsistent replication factor
-    try {
-      val replicationAssignmentStr = "0,1,2:1,2"
-      CreateTopicCommand.getManualReplicaAssignment(replicationAssignmentStr, brokerList)
-      fail("all partitions should have the same replication factor")
-    }
-    catch {
-      case e: AdministrationException => // this is good
-      case e2: Throwable => throw e2
+    intercept[IllegalArgumentException] {
+      AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, "test", Map(0->Seq(0,1), 1->Seq(0)))
     }
 
     // good assignment
-    {
-      val replicationAssignmentStr = "0:1:2,1:2:3"
-      val expectedReplicationAssignment = Map(
-        0 -> List(0, 1, 2),
-        1 -> List(1, 2, 3)
-      )
-      val actualReplicationAssignment = CreateTopicCommand.getManualReplicaAssignment(replicationAssignmentStr, brokerList)
-      assertEquals(expectedReplicationAssignment.size, actualReplicationAssignment.size)
-      for( (part, replicas) <- expectedReplicationAssignment ) {
-        assertEquals(replicas, actualReplicationAssignment(part))
-      }
-    }
+    val assignment = Map(0 -> List(0, 1, 2),
+                         1 -> List(1, 2, 3))
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, "test", assignment)
+    val found = ZkUtils.getPartitionAssignmentForTopics(zkClient, Seq("test"))
+    assertEquals(assignment, found("test"))
   }
 
   @Test
@@ -157,7 +120,7 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     val topic = "test"
     TestUtils.createBrokersInZk(zkClient, List(0, 1, 2, 3, 4))
     // create the topic
-    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(topic, expectedReplicaAssignment, zkClient)
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, expectedReplicaAssignment)
     // create leaders for all partitions
     TestUtils.makeLeaderForPartition(zkClient, topic, leaderForPartitionMap, 1)
     val actualReplicaList = leaderForPartitionMap.keys.toArray.map(p => (p -> ZkUtils.getReplicasForPartition(zkClient, topic, p))).toMap
@@ -165,13 +128,16 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     for(i <- 0 until actualReplicaList.size)
       assertEquals(expectedReplicaAssignment.get(i).get, actualReplicaList(i))
 
-    try {
-      AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(topic, expectedReplicaAssignment, zkClient)
-      fail("shouldn't be able to create a topic already exists")
-    } catch {
-      case e: TopicExistsException => // this is good
-      case e2: Throwable => throw e2
+    intercept[TopicExistsException] {
+      // shouldn't be able to create a topic that already exists
+      AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, expectedReplicaAssignment)
     }
+  }
+
+  private def getBrokersWithPartitionDir(servers: Iterable[KafkaServer], topic: String, partitionId: Int): Set[Int] = {
+    servers.filter(server => new File(server.config.logDirs.head, topic + "-" + partitionId).exists)
+           .map(_.config.brokerId)
+           .toSet
   }
 
   @Test
@@ -181,7 +147,7 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     // create brokers
     val servers = TestUtils.createBrokerConfigs(4).map(b => TestUtils.createServer(new KafkaConfig(b)))
     // create the topic
-    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(topic, expectedReplicaAssignment, zkClient)
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, expectedReplicaAssignment)
     // reassign partition 0
     val newReplicas = Seq(0, 2, 3)
     val partitionToBeReassigned = 0
@@ -195,7 +161,11 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
       Map(topicAndPartition -> newReplicas), partitionsBeingReassigned) == ReassignmentCompleted;
     }, 1000)
     val assignedReplicas = ZkUtils.getReplicasForPartition(zkClient, topic, partitionToBeReassigned)
+    // in sync replicas should not have any replica that is not in the new assigned replicas
+    checkForPhantomInSyncReplicas(zkClient, topic, partitionToBeReassigned, assignedReplicas)
     assertEquals("Partition should have been reassigned to 0, 2, 3", newReplicas, assignedReplicas)
+    ensureNoUnderReplicatedPartitions(zkClient, topic, partitionToBeReassigned, assignedReplicas, servers)
+    assertTrue(TestUtils.waitUntilTrue(() => getBrokersWithPartitionDir(servers, topic, 0) == newReplicas.toSet, 5000))
     servers.foreach(_.shutdown())
   }
 
@@ -206,7 +176,7 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     // create brokers
     val servers = TestUtils.createBrokerConfigs(4).map(b => TestUtils.createServer(new KafkaConfig(b)))
     // create the topic
-    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(topic, expectedReplicaAssignment, zkClient)
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, expectedReplicaAssignment)
     // reassign partition 0
     val newReplicas = Seq(1, 2, 3)
     val partitionToBeReassigned = 0
@@ -221,7 +191,9 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     }, 1000)
     val assignedReplicas = ZkUtils.getReplicasForPartition(zkClient, topic, partitionToBeReassigned)
     assertEquals("Partition should have been reassigned to 0, 2, 3", newReplicas, assignedReplicas)
-    // leader should be 2
+    checkForPhantomInSyncReplicas(zkClient, topic, partitionToBeReassigned, assignedReplicas)
+    ensureNoUnderReplicatedPartitions(zkClient, topic, partitionToBeReassigned, assignedReplicas, servers)
+    assertTrue(TestUtils.waitUntilTrue(() => getBrokersWithPartitionDir(servers, topic, 0) == newReplicas.toSet, 5000))
     servers.foreach(_.shutdown())
   }
 
@@ -232,7 +204,7 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     // create brokers
     val servers = TestUtils.createBrokerConfigs(4).map(b => TestUtils.createServer(new KafkaConfig(b)))
     // create the topic
-    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(topic, expectedReplicaAssignment, zkClient)
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, expectedReplicaAssignment)
     // reassign partition 0
     val newReplicas = Seq(2, 3)
     val partitionToBeReassigned = 0
@@ -247,7 +219,9 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     }, 2000)
     val assignedReplicas = ZkUtils.getReplicasForPartition(zkClient, topic, partitionToBeReassigned)
     assertEquals("Partition should have been reassigned to 2, 3", newReplicas, assignedReplicas)
-    // leader should be 2
+    checkForPhantomInSyncReplicas(zkClient, topic, partitionToBeReassigned, assignedReplicas)
+    ensureNoUnderReplicatedPartitions(zkClient, topic, partitionToBeReassigned, assignedReplicas, servers)
+    assertTrue(TestUtils.waitUntilTrue(() => getBrokersWithPartitionDir(servers, topic, 0) == newReplicas.toSet, 5000))
     servers.foreach(_.shutdown())
   }
 
@@ -264,7 +238,6 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     assertTrue("Partition reassignment failed for test, 0", reassignPartitionsCommand.reassignPartitions())
     val reassignedPartitions = ZkUtils.getPartitionsBeingReassigned(zkClient)
     assertFalse("Partition should not be reassigned", reassignedPartitions.contains(topicAndPartition))
-    // leader should be 2
     servers.foreach(_.shutdown())
   }
 
@@ -273,7 +246,7 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     val expectedReplicaAssignment = Map(0  -> List(0, 1))
     val topic = "test"
     // create the topic
-    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(topic, expectedReplicaAssignment, zkClient)
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, expectedReplicaAssignment)
     // put the partition in the reassigned path as well
     // reassign partition 0
     val newReplicas = Seq(0, 1)
@@ -283,9 +256,13 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     reassignPartitionsCommand.reassignPartitions
     // create brokers
     val servers = TestUtils.createBrokerConfigs(2).map(b => TestUtils.createServer(new KafkaConfig(b)))
-    TestUtils.waitUntilTrue(checkIfReassignPartitionPathExists, 1000)
+    TestUtils.waitUntilTrue(() => checkIfReassignPartitionPathExists(zkClient), 1000)
     val assignedReplicas = ZkUtils.getReplicasForPartition(zkClient, topic, partitionToBeReassigned)
     assertEquals("Partition should have been reassigned to 0, 1", newReplicas, assignedReplicas)
+    checkForPhantomInSyncReplicas(zkClient, topic, partitionToBeReassigned, assignedReplicas)
+    // ensure that there are no under replicated partitions
+    ensureNoUnderReplicatedPartitions(zkClient, topic, partitionToBeReassigned, assignedReplicas, servers)
+    assertTrue(TestUtils.waitUntilTrue(() => getBrokersWithPartitionDir(servers, topic, 0) == newReplicas.toSet, 5000))
     servers.foreach(_.shutdown())
   }
 
@@ -312,7 +289,7 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     // create brokers
     val serverConfigs = TestUtils.createBrokerConfigs(3).map(new KafkaConfig(_))
     // create the topic
-    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(topic, expectedReplicaAssignment, zkClient)
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, expectedReplicaAssignment)
     val servers = serverConfigs.reverse.map(s => TestUtils.createServer(s))
     // broker 2 should be the leader since it was started first
     val currentLeader = TestUtils.waitUntilLeaderIsElectedOrChanged(zkClient, topic, partition, 1000, None).get
@@ -333,8 +310,7 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     val serverConfigs = TestUtils.createBrokerConfigs(3).map(new KafkaConfig(_))
     val servers = serverConfigs.reverse.map(s => TestUtils.createServer(s))
     // create the topic
-    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(topic, expectedReplicaAssignment, zkClient)
-
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, expectedReplicaAssignment)
     TestUtils.waitUntilMetadataIsPropagated(servers, topic, partition, 1000)
 
     val controllerId = ZkUtils.getController(zkClient)
@@ -344,9 +320,9 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
     try {
       // wait for the update metadata request to trickle to the brokers
       assertTrue("Topic test not created after timeout", TestUtils.waitUntilTrue(() =>
-        activeServers.foldLeft(true)(_ && _.apis.leaderCache(TopicAndPartition(topic, partition)).leaderIsrAndControllerEpoch.leaderAndIsr.isr.size != 3), 1000))
+        activeServers.foldLeft(true)(_ && _.apis.metadataCache(TopicAndPartition(topic, partition)).leaderIsrAndControllerEpoch.leaderAndIsr.isr.size != 3), 1000))
       assertEquals(0, partitionsRemaining.size)
-      var partitionStateInfo = activeServers.head.apis.leaderCache(TopicAndPartition(topic, partition))
+      var partitionStateInfo = activeServers.head.apis.metadataCache(TopicAndPartition(topic, partition))
       var leaderAfterShutdown = partitionStateInfo.leaderIsrAndControllerEpoch.leaderAndIsr.leader
       assertEquals(0, leaderAfterShutdown)
       assertEquals(2, partitionStateInfo.leaderIsrAndControllerEpoch.leaderAndIsr.isr.size)
@@ -355,22 +331,63 @@ class AdminTest extends JUnit3Suite with ZooKeeperTestHarness with Logging {
       partitionsRemaining = controller.shutdownBroker(1)
       assertEquals(0, partitionsRemaining.size)
       activeServers = servers.filter(s => s.config.brokerId == 0)
-      partitionStateInfo = activeServers.head.apis.leaderCache(TopicAndPartition(topic, partition))
+      partitionStateInfo = activeServers.head.apis.metadataCache(TopicAndPartition(topic, partition))
       leaderAfterShutdown = partitionStateInfo.leaderIsrAndControllerEpoch.leaderAndIsr.leader
       assertEquals(0, leaderAfterShutdown)
 
-      assertTrue(servers.foldLeft(true)(_ && _.apis.leaderCache(TopicAndPartition(topic, partition)).leaderIsrAndControllerEpoch.leaderAndIsr.leader == 0))
+      assertTrue(servers.foldLeft(true)(_ && _.apis.metadataCache(TopicAndPartition(topic, partition)).leaderIsrAndControllerEpoch.leaderAndIsr.leader == 0))
       partitionsRemaining = controller.shutdownBroker(0)
       assertEquals(1, partitionsRemaining.size)
       // leader doesn't change since all the replicas are shut down
-      assertTrue(servers.foldLeft(true)(_ && _.apis.leaderCache(TopicAndPartition(topic, partition)).leaderIsrAndControllerEpoch.leaderAndIsr.leader == 0))
+      assertTrue(servers.foldLeft(true)(_ && _.apis.metadataCache(TopicAndPartition(topic, partition)).leaderIsrAndControllerEpoch.leaderAndIsr.leader == 0))
     }
     finally {
       servers.foreach(_.shutdown())
     }
   }
 
-  private def checkIfReassignPartitionPathExists(): Boolean = {
-    ZkUtils.pathExists(zkClient, ZkUtils.ReassignPartitionsPath)
+  /**
+   * This test creates a topic with a few config overrides and checks that the configs are applied to the new topic
+   * then changes the config and checks that the new values take effect.
+   */
+  @Test
+  def testTopicConfigChange() {
+    val partitions = 3
+    val topic = "my-topic"
+    val server = TestUtils.createServer(new KafkaConfig(TestUtils.createBrokerConfig(0)))
+
+    def makeConfig(messageSize: Int, retentionMs: Long) = {
+      var props = new Properties()
+      props.setProperty(LogConfig.MaxMessageBytesProp, messageSize.toString)
+      props.setProperty(LogConfig.RententionMsProp, retentionMs.toString)
+      props
+    }
+
+    def checkConfig(messageSize: Int, retentionMs: Long) {
+      TestUtils.retry(10000) {
+        for(part <- 0 until partitions) {
+          val logOpt = server.logManager.getLog(TopicAndPartition(topic, part))
+          assertTrue(logOpt.isDefined)
+          assertEquals(retentionMs, logOpt.get.config.retentionMs)
+          assertEquals(messageSize, logOpt.get.config.maxMessageSize)
+        }
+      }
+    }
+
+    try {
+      // create a topic with a few config overrides and check that they are applied
+      val maxMessageSize = 1024
+      val retentionMs = 1000*1000
+      AdminUtils.createTopic(server.zkClient, topic, partitions, 1, makeConfig(maxMessageSize, retentionMs))
+      checkConfig(maxMessageSize, retentionMs)
+
+      // now double the config values for the topic and check that it is applied
+      AdminUtils.changeTopicConfig(server.zkClient, topic, makeConfig(2*maxMessageSize, 2 * retentionMs))
+      checkConfig(2*maxMessageSize, 2 * retentionMs)
+    } finally {
+      server.shutdown()
+      server.config.logDirs.map(Utils.rm(_))
+    }
   }
+
 }

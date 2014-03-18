@@ -26,6 +26,7 @@ import kafka.controller.LeaderIsrAndControllerEpoch
 import kafka.network.{BoundedByteBufferSend, RequestChannel}
 import kafka.common.ErrorMapping
 import kafka.network.RequestChannel.Response
+import collection.Set
 
 
 object LeaderAndIsr {
@@ -37,11 +38,7 @@ case class LeaderAndIsr(var leader: Int, var leaderEpoch: Int, var isr: List[Int
   def this(leader: Int, isr: List[Int]) = this(leader, LeaderAndIsr.initialLeaderEpoch, isr, LeaderAndIsr.initialZKVersion)
 
   override def toString(): String = {
-    val jsonDataMap = new collection.mutable.HashMap[String, String]
-    jsonDataMap.put("leader", leader.toString)
-    jsonDataMap.put("leaderEpoch", leaderEpoch.toString)
-    jsonDataMap.put("ISR", isr.mkString(","))
-    Utils.mapToJson(jsonDataMap, valueInQuotes = true)
+    Json.encode(Map("leader" -> leader, "leader_epoch" -> leaderEpoch, "isr" -> isr))
   }
 }
 
@@ -177,16 +174,7 @@ case class LeaderAndIsrRequest (versionId: Short,
   }
 
   override def toString(): String = {
-    val leaderAndIsrRequest = new StringBuilder
-    leaderAndIsrRequest.append("Name:" + this.getClass.getSimpleName)
-    leaderAndIsrRequest.append(";Version:" + versionId)
-    leaderAndIsrRequest.append(";Controller:" + controllerId)
-    leaderAndIsrRequest.append(";ControllerEpoch:" + controllerEpoch)
-    leaderAndIsrRequest.append(";CorrelationId:" + correlationId)
-    leaderAndIsrRequest.append(";ClientId:" + clientId)
-    leaderAndIsrRequest.append(";PartitionState:" + partitionStateInfos.mkString(","))
-    leaderAndIsrRequest.append(";Leaders:" + leaders.mkString(","))
-    leaderAndIsrRequest.toString()
+    describe(true)
   }
 
   override  def handleError(e: Throwable, requestChannel: RequestChannel, request: RequestChannel.Request): Unit = {
@@ -195,5 +183,19 @@ case class LeaderAndIsrRequest (versionId: Short,
     }
     val errorResponse = LeaderAndIsrResponse(correlationId, responseMap)
     requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(errorResponse)))
+  }
+
+  override def describe(details: Boolean): String = {
+    val leaderAndIsrRequest = new StringBuilder
+    leaderAndIsrRequest.append("Name:" + this.getClass.getSimpleName)
+    leaderAndIsrRequest.append(";Version:" + versionId)
+    leaderAndIsrRequest.append(";Controller:" + controllerId)
+    leaderAndIsrRequest.append(";ControllerEpoch:" + controllerEpoch)
+    leaderAndIsrRequest.append(";CorrelationId:" + correlationId)
+    leaderAndIsrRequest.append(";ClientId:" + clientId)
+    leaderAndIsrRequest.append(";Leaders:" + leaders.mkString(","))
+    if(details)
+      leaderAndIsrRequest.append(";PartitionState:" + partitionStateInfos.mkString(","))
+    leaderAndIsrRequest.toString()
   }
 }
