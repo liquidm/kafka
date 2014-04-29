@@ -23,6 +23,7 @@ import collection.Set
 import kafka.common.{ErrorMapping, TopicAndPartition}
 import kafka.api.{StopReplicaResponse, RequestOrResponse}
 import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * This manages the state machine for topic deletion.
@@ -71,12 +72,13 @@ class TopicDeletionManager(controller: KafkaController,
   val controllerContext = controller.controllerContext
   val partitionStateMachine = controller.partitionStateMachine
   val replicaStateMachine = controller.replicaStateMachine
-  var topicsToBeDeleted: mutable.Set[String] = mutable.Set.empty[String] ++ initialTopicsToBeDeleted
+  val topicsToBeDeleted: mutable.Set[String] = mutable.Set.empty[String] ++ initialTopicsToBeDeleted
+  val partitionsToBeDeleted: mutable.Set[TopicAndPartition] = topicsToBeDeleted.flatMap(controllerContext.partitionsForTopic)
   val deleteLock = new ReentrantLock()
-  var topicsIneligibleForDeletion: mutable.Set[String] = mutable.Set.empty[String] ++
+  val topicsIneligibleForDeletion: mutable.Set[String] = mutable.Set.empty[String] ++
     (initialTopicsIneligibleForDeletion & initialTopicsToBeDeleted)
   val deleteTopicsCond = deleteLock.newCondition()
-  var deleteTopicStateChanged: Boolean = false
+  val deleteTopicStateChanged: AtomicBoolean = new AtomicBoolean(false)
   var deleteTopicsThread: DeleteTopicsThread = null
   val isDeleteTopicEnabled = controller.config.deleteTopicEnable
 
@@ -86,7 +88,7 @@ class TopicDeletionManager(controller: KafkaController,
   def start() {
     if(isDeleteTopicEnabled) {
       deleteTopicsThread = new DeleteTopicsThread()
-      deleteTopicStateChanged = true
+      deleteTopicStateChanged.set(true)
       deleteTopicsThread.start()
     }
   }
@@ -98,6 +100,7 @@ class TopicDeletionManager(controller: KafkaController,
     if(isDeleteTopicEnabled) {
       deleteTopicsThread.shutdown()
       topicsToBeDeleted.clear()
+      partitionsToBeDeleted.clear()
       topicsIneligibleForDeletion.clear()
     }
   }
@@ -111,6 +114,7 @@ class TopicDeletionManager(controller: KafkaController,
   def enqueueTopicsForDeletion(topics: Set[String]) {
     if(isDeleteTopicEnabled) {
       topicsToBeDeleted ++= topics
+      partitionsToBeDeleted ++= topics.flatMap(controllerContext.partitionsForTopic)
       resumeTopicDeletionThread()
     }
   }
@@ -198,12 +202,10 @@ class TopicDeletionManager(controller: KafkaController,
    */
   private def awaitTopicDeletionNotification() {
     inLock(deleteLock) {
-      while(!deleteTopicStateChanged) {
+      while(!deleteTopicStateChanged.compareAndSet(true, false)) {
         info("Waiting for signal to start or continue topic deletion")
-
         deleteTopicsCond.await()
       }
-      deleteTopicStateChanged = false
     }
   }
 
@@ -211,7 +213,7 @@ class TopicDeletionManager(controller: KafkaController,
    * Signals the delete-topic-thread to process topic deletion
    */
   private def resumeTopicDeletionThread() {
-    deleteTopicStateChanged = true
+    deleteTopicStateChanged.set(true)
     inLock(deleteLock) {
       deleteTopicsCond.signal()
     }
@@ -265,6 +267,7 @@ class TopicDeletionManager(controller: KafkaController,
     partitionStateMachine.handleStateChanges(partitionsForDeletedTopic, OfflinePartition)
     partitionStateMachine.handleStateChanges(partitionsForDeletedTopic, NonExistentPartition)
     topicsToBeDeleted -= topic
+    partitionsToBeDeleted.retain(_.topic != topic)
     controllerContext.zkClient.deleteRecursive(ZkUtils.getTopicPath(topic))
     controllerContext.zkClient.deleteRecursive(ZkUtils.getTopicConfigPath(topic))
     controllerContext.zkClient.delete(ZkUtils.getDeleteTopicPath(topic))
@@ -278,7 +281,8 @@ class TopicDeletionManager(controller: KafkaController,
   private def onTopicDeletion(topics: Set[String]) {
     info("Topic deletion callback for %s".format(topics.mkString(",")))
     // send update metadata so that brokers stop serving data for topics to be deleted
-    controller.sendUpdateMetadataRequest(controllerContext.liveOrShuttingDownBrokerIds.toSeq)
+    val partitions = topics.flatMap(controllerContext.partitionsForTopic)
+    controller.sendUpdateMetadataRequest(controllerContext.liveOrShuttingDownBrokerIds.toSeq, partitions)
     val partitionReplicaAssignmentByTopic = controllerContext.partitionReplicaAssignment.groupBy(p => p._1.topic)
     topics.foreach { topic =>
       onPartitionDeletion(partitionReplicaAssignmentByTopic(topic).map(_._1).toSet)
@@ -323,8 +327,8 @@ class TopicDeletionManager(controller: KafkaController,
   /**
    * This callback is invoked by the delete topic callback with the list of partitions for topics to be deleted
    * It does the following -
-   * 1. Send UpdateMetadataRequest to all live brokers (that are not shutting down) with all partitions except those for
-   *    which the topics are being deleted. The brokers start rejecting all client requests with UnknownTopicOrPartitionException
+   * 1. Send UpdateMetadataRequest to all live brokers (that are not shutting down) for partitions that are being
+   *    deleted. The brokers start rejecting all client requests with UnknownTopicOrPartitionException
    * 2. Move all replicas for the partitions to OfflineReplica state. This will send StopReplicaRequest to the replicas
    *    and LeaderAndIsrRequest to the leader with the shrunk ISR. When the leader replica itself is moved to OfflineReplica state,
    *    it will skip sending the LeaderAndIsrRequest since the leader will be updated to -1
