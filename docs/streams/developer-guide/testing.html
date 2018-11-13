@@ -102,6 +102,14 @@ ConsumerRecordFactory&lt;String, Integer&gt; factory = new ConsumerRecordFactory
 testDriver.pipe(factory.create("key", 42L));
         </pre>
             <p>
+                The <code>ConsumerRecordFactory</code> can automatically with key and value type <code>byte[]</code>.
+                Because <code>byte[]</code> types can be problematic, you can use the <code>ConsumerRecordFactory</code>
+                to generate those records
+                by providing regular Java types for key and values and the corresponding serializers.
+            </p>
+        <pre>
+        </pre>
+            <p>
                 To verify the output, the test driver produces <code>ProducerRecord</code>s with key and value type
                 <code>byte[]</code>.
                 For result verification, you can specify corresponding deserializers when reading the output record from
