@@ -29,4 +29,4 @@ publish-image: image
 	docker push $(PROJECT_IMAGE)
 
 publish-artifact: artifact
-	cd $(PROJECT_ARTIFACT) && (find . -maxdepth 1 -name *.tgz | sed -e 's,^\./,,' | xargs -I '{}' gsutil cp {} gs://lqm-artifact-storage/$(PROJECT_NAME)/${PROJECT_REV})
+	cd $(PROJECT_ARTIFACT) && (find . |grep tgz |grep -v docs.tgz | sed -e 's,^\./,,' | xargs -I '{}' gsutil cp {} gs://lqm-artifact-storage/$(PROJECT_NAME)/${PROJECT_REV})
