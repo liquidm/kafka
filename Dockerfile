@@ -4,7 +4,7 @@ RUN apt-get update \
       && apt-get install -y openjdk-8-jdk-headless \
                             git \
                             curl \
-                            wget
+                            wget \
       && apt-get clean
 
 
