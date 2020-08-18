@@ -1,4 +1,4 @@
-PROJECT_NAME = druid
+PROJECT_NAME = kafka
 
 PROJECT_ROOT = $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 PROJECT_BIN = $(PROJECT_NAME)
