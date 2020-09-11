@@ -1,8 +1,10 @@
 kind: pipeline
 name: default
 
-image_pull_secrets:
-  - DOCKER_CONFIG_JSON
+volumes:
+- name: docker-config
+  host:
+    path:  /root/.docker/config.json
 
 steps:
 - name: docker
@@ -12,6 +14,9 @@ steps:
 
 - name: publish artifact
   image: registry.lqm.io/dind
+  volumes:
+  - name: docker-config
+    path: /root/.docker/config.json
   environment:
     DOCKER_HOST: docker:2375
     GSUTIL_CONFIG_JSON:
