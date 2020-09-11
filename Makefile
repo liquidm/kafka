@@ -20,7 +20,7 @@ build:
 	./gradlew clean releaseTarGz
 
 image:
-	docker build -t $(PROJECT_IMAGE) .
+	docker build -t $(PROJECT_IMAGE) -t $(PROJECT_IMAGE_BRANCHED) .
 
 artifact: image
 	$(eval CID := $(shell docker create $(PROJECT_IMAGE)))
