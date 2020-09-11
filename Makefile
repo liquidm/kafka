@@ -4,7 +4,7 @@ PROJECT_ROOT = $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 PROJECT_BIN = $(PROJECT_NAME)
 
 PROJECT_REV = $(shell git rev-parse HEAD)
-PROJECT_IMAGE = registry.build.lqm.io/$(PROJECT_NAME):$(PROJECT_REV)
+PROJECT_IMAGE = registry.lqm.io/$(PROJECT_NAME):$(PROJECT_REV)
 
 PROJECT_ARTIFACT = /tmp/$(PROJECT_NAME)_$(PROJECT_REV)
 
